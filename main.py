@@ -1582,9 +1582,9 @@ class HeartRateWindow(QMainWindow):
                     QMessageBox.Yes
                 )
                 
-                if reply == QMessageBox.Yes and release_url:
-                    import webbrowser
-                    webbrowser.open(release_url)
+                if reply == QMessageBox.Yes:
+                    # 尝试自动下载并安装新版本
+                    self.download_and_install_update(data)
                     
         except urllib.error.HTTPError as e:
             if e.code == 404:
@@ -1599,6 +1599,63 @@ class HeartRateWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "检查更新", f"检查更新失败: {str(e)}")
 
+    def download_and_install_update(self, release_data):
+        """自动下载并安装新版本"""
+        try:
+            # 显示下载进度对话框
+            from PyQt5.QtWidgets import QProgressDialog
+            progress = QProgressDialog("正在下载更新...", "取消", 0, 100, self)
+            progress.setWindowTitle("下载更新")
+            progress.setWindowModality(True)
+            progress.show()
+            
+            # 获取下载链接
+            assets = release_data.get('assets', [])
+            download_url = None
+            for asset in assets:
+                if asset.get('name', '').endswith('.exe'):
+                    download_url = asset.get('browser_download_url')
+                    break
+            
+            if not download_url:
+                QMessageBox.warning(self, "下载失败", "未找到可下载的安装文件")
+                return
+            
+            # 下载文件
+            import tempfile
+            import os
+            temp_dir = tempfile.gettempdir()
+            file_name = os.path.join(temp_dir, f"HeartRateReceiver_{release_data.get('tag_name', 'latest')}.exe")
+            
+            def report_progress(count, block_size, total_size):
+                percent = int(count * block_size * 100 / total_size)
+                progress.setValue(percent)
+                QApplication.processEvents()
+                if progress.wasCanceled():
+                    raise Exception("下载被用户取消")
+            
+            import urllib.request
+            urllib.request.urlretrieve(download_url, file_name, reporthook=report_progress)
+            
+            progress.close()
+            
+            # 运行安装程序
+            QMessageBox.information(self, "下载完成", "更新文件已下载完成，即将开始安装")
+            
+            import subprocess
+            subprocess.Popen([file_name])
+            
+            # 退出当前应用程序
+            QApplication.instance().quit()
+            
+        except Exception as e:
+            QMessageBox.warning(self, "更新失败", f"自动更新失败: {str(e)}")
+            # 如果自动更新失败，回退到打开浏览器
+            release_url = release_data.get('html_url', '')
+            if release_url:
+                import webbrowser
+                webbrowser.open(release_url)
+
     def check_update_at_startup(self):
         try:
             req = urllib.request.Request(GITHUB_RELEASES_API)
@@ -1607,7 +1664,6 @@ class HeartRateWindow(QMainWindow):
             with urllib.request.urlopen(req, timeout=10) as response:
                 data = json.loads(response.read().decode('utf-8'))
                 latest_version = data.get('tag_name', '')
-                release_url = data.get('html_url', '')
                 release_notes = data.get('body', '')
             
             if not latest_version:
@@ -1628,9 +1684,9 @@ class HeartRateWindow(QMainWindow):
                     QMessageBox.Ok
                 )
                 
-                if reply == QMessageBox.Ok and release_url:
-                    import webbrowser
-                    webbrowser.open(release_url)
+                if reply == QMessageBox.Ok:
+                    # 尝试自动下载并安装新版本
+                    self.download_and_install_update(data)
                 
                 # 无论用户选择什么，都退出软件
                 QApplication.instance().quit()
