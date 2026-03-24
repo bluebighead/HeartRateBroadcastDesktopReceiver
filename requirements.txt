@@ -1,3 +1,4 @@
 PyQt5>=5.15.0
 bleak>=0.20.0
 pyqtgraph>=0.13.0
+openpyxl>=3.1.0

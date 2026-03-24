@@ -2,6 +2,7 @@ import sys
 import asyncio
 import time
 import json
+import csv
 import urllib.request
 import urllib.error
 from datetime import datetime
@@ -10,14 +11,14 @@ from PyQt5.QtWidgets import (
     QLabel, QPushButton, QMessageBox, QStackedWidget, QTableWidget,
     QTableWidgetItem, QHeaderView, QAbstractItemView, QGraphicsOpacityEffect,
     QDialog, QCheckBox, QLineEdit, QComboBox, QSpinBox, QFormLayout,
-    QMenuBar, QAction, QGroupBox
+    QMenuBar, QAction, QGroupBox, QFileDialog
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, pyqtProperty
 from PyQt5.QtGui import QFont
 from bleak import BleakClient, BleakScanner
 import pyqtgraph as pg
 
-APP_VERSION = "v1.0.0"
+APP_VERSION = "v1.0.1"
 GITHUB_REPO = "bluebighead/HeartRateBroadcastDesktopReceiver"
 GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -27,6 +28,7 @@ HEART_RATE_MEASUREMENT_UUID = "00002A37-0000-1000-8000-00805F9B34FB"
 
 class BleakWorker(QThread):
     heart_rate_received = pyqtSignal(int)
+    rr_interval_received = pyqtSignal(list)
     status_changed = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
 
@@ -73,12 +75,35 @@ class BleakWorker(QThread):
             self.status_changed.emit("已断开连接")
 
     def _heart_rate_handler(self, sender, data):
+        if len(data) < 2:
+            return
+        
         flags = data[0]
+        offset = 1
+        
         if flags & 0x01:
-            heart_rate = int.from_bytes(data[1:3], byteorder='little')
+            heart_rate = int.from_bytes(data[offset:offset+2], byteorder='little')
+            offset += 2
         else:
-            heart_rate = data[1]
+            heart_rate = data[offset]
+            offset += 1
+        
+        if flags & 0x08:
+            offset += 2
+        
+        rr_intervals = []
+        if flags & 0x10:
+            while offset + 1 < len(data):
+                rr_raw = int.from_bytes(data[offset:offset+2], byteorder='little')
+                rr_ms = rr_raw * (1000.0 / 1024.0)
+                if rr_ms > 0:
+                    rr_intervals.append(rr_ms)
+                offset += 2
+        
         self.heart_rate_received.emit(heart_rate)
+        
+        if rr_intervals:
+            self.rr_interval_received.emit(rr_intervals)
 
     def stop(self):
         self.running = False
@@ -291,6 +316,13 @@ class HomePage(QWidget):
             'age': 30,
             'gender': 'male'
         }
+        self.hrv_enabled = False
+        self.obs_enabled = False
+        self.obs_file_path = "obs_heart_rate.txt"
+        self.heart_rate_timestamps = []
+        self.hrv_window_size = 30
+        self.real_rr_intervals = []
+        self.using_real_rr = False
         self.init_ui()
         
         self.calorie_timer = QTimer()
@@ -334,6 +366,118 @@ class HomePage(QWidget):
         self.duration_label.setAlignment(Qt.AlignCenter)
         self.duration_label.setStyleSheet("color: #7F8C8D;")
         layout.addWidget(self.duration_label)
+        
+        layout.addSpacing(10)
+        
+        self.hrv_frame = QGroupBox()
+        self.hrv_frame.setStyleSheet("""
+            QGroupBox {
+                background-color: #F8F9FA;
+                border: 1px solid #DEE2E6;
+                border-radius: 8px;
+                margin-top: 5px;
+                padding: 10px;
+            }
+        """)
+        hrv_layout = QVBoxLayout(self.hrv_frame)
+        hrv_layout.setSpacing(5)
+        
+        hrv_title_layout = QHBoxLayout()
+        hrv_title_layout.setAlignment(Qt.AlignCenter)
+        hrv_title_layout.setSpacing(10)
+        
+        hrv_title = QLabel("心率变异性 (HRV)")
+        hrv_title.setFont(QFont("Arial", 11, QFont.Bold))
+        hrv_title.setStyleSheet("color: #2C3E50;")
+        hrv_title_layout.addWidget(hrv_title)
+        
+        hrv_help = QLabel("?")
+        hrv_help.setFont(QFont("Arial", 12, QFont.Bold))
+        hrv_help.setStyleSheet("""
+            QLabel {
+                color: white;
+                background-color: #3498DB;
+                border-radius: 10px;
+                padding: 0px 6px;
+                min-width: 20px;
+                min-height: 20px;
+            }
+        """)
+        hrv_help.setFixedSize(20, 20)
+        hrv_help.setAlignment(Qt.AlignCenter)
+        hrv_help.setToolTip(
+            "心率变异性 (HRV) 说明：\n\n"
+            "HRV 是衡量自主神经系统活动的重要指标。\n\n"
+            "• RMSSD：相邻心跳间隔差值的均方根\n"
+            "• 高 HRV：身体恢复良好，压力低\n"
+            "• 低 HRV：压力大，需要休息\n\n"
+            "数据来源：\n"
+            "• (真实RR间期)：设备发送的精确数据\n"
+            "• (心率推算)：根据心率估算，仅供参考"
+        )
+        hrv_title_layout.addWidget(hrv_help)
+        
+        hrv_layout.addLayout(hrv_title_layout)
+        
+        self.hrv_value_label = QLabel("RMSSD: -- ms")
+        self.hrv_value_label.setFont(QFont("Arial", 12))
+        self.hrv_value_label.setAlignment(Qt.AlignCenter)
+        self.hrv_value_label.setStyleSheet("color: #3498DB;")
+        hrv_layout.addWidget(self.hrv_value_label)
+        
+        self.hrv_status_label = QLabel("状态: 等待数据...")
+        self.hrv_status_label.setFont(QFont("Arial", 11))
+        self.hrv_status_label.setAlignment(Qt.AlignCenter)
+        self.hrv_status_label.setStyleSheet("color: #7F8C8D;")
+        hrv_layout.addWidget(self.hrv_status_label)
+        
+        self.hrv_bar = QLabel()
+        self.hrv_bar.setFixedHeight(8)
+        self.hrv_bar.setStyleSheet("background-color: #E0E0E0; border-radius: 4px;")
+        hrv_layout.addWidget(self.hrv_bar)
+        
+        layout.addWidget(self.hrv_frame)
+        
+        # OBS对接网址显示区域
+        obs_url_layout = QHBoxLayout()
+        obs_url_layout.setAlignment(Qt.AlignCenter)
+        obs_url_layout.setSpacing(10)
+        
+        self.obs_url_label = QLabel("OBS对接网址:")
+        self.obs_url_label.setFont(QFont("Arial", 11))
+        self.obs_url_label.setStyleSheet("color: #7F8C8D;")
+        
+        self.obs_url_display = QLabel("")
+        self.obs_url_display.setFont(QFont("Arial", 11))
+        self.obs_url_display.setStyleSheet("color: #3498DB; background-color: #F8F9FA; padding: 5px 10px; border: 1px solid #DEE2E6; border-radius: 4px;")
+        self.obs_url_display.setMinimumWidth(200)
+        
+        self.obs_copy_button = QPushButton("复制")
+        self.obs_copy_button.setFont(QFont("Arial", 10))
+        self.obs_copy_button.setFixedSize(60, 25)
+        self.obs_copy_button.setStyleSheet("""
+            QPushButton {
+                background-color: #3498DB;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                padding: 2px;
+            }
+            QPushButton:hover {
+                background-color: #2980B9;
+            }
+        """)
+        self.obs_copy_button.clicked.connect(self.copy_obs_url)
+        
+        obs_url_layout.addWidget(self.obs_url_label)
+        obs_url_layout.addWidget(self.obs_url_display)
+        obs_url_layout.addWidget(self.obs_copy_button)
+        
+        self.obs_url_frame = QWidget()
+        self.obs_url_frame.setLayout(obs_url_layout)
+        self.obs_url_frame.hide()  # 默认隐藏
+        
+        layout.addWidget(self.obs_url_frame)
         
         layout.addSpacing(15)
         
@@ -410,12 +554,20 @@ class HomePage(QWidget):
         self.current_heart_rate = 0
         self.calorie_label.setText("消耗卡路里: 0.0 kcal")
         self.duration_label.setText("运动时长: 00:00:00")
+        self.heart_rate_timestamps = []
+        self.real_rr_intervals = []
+        self.using_real_rr = False
+        self.hrv_value_label.setText("RMSSD: -- ms")
+        self.hrv_status_label.setText("状态: 等待数据...")
+        self.hrv_status_label.setStyleSheet("color: #7F8C8D;")
+        self.hrv_bar.setStyleSheet("background-color: #E0E0E0; border-radius: 4px;")
         
         self.heart_animation.start_beating()
         self.calorie_timer.start(1000)
         
         self.ble_worker = BleakWorker()
         self.ble_worker.heart_rate_received.connect(self.update_heart_rate)
+        self.ble_worker.rr_interval_received.connect(self.update_rr_intervals)
         self.ble_worker.status_changed.connect(self.update_status)
         self.ble_worker.error_occurred.connect(self.show_error)
         self.ble_worker.start()
@@ -440,10 +592,140 @@ class HomePage(QWidget):
         self.current_heart_rate = heart_rate
         self.heart_animation.update_heart_rate(heart_rate)
         
+        current_time = time.time()
+        self.heart_rate_timestamps.append((heart_rate, current_time))
+        if len(self.heart_rate_timestamps) > self.hrv_window_size:
+            self.heart_rate_timestamps.pop(0)
+        
+        self.update_hrv()
+        self.update_obs_data(heart_rate)
+        self.update_obs_url_display()  # 更新OBS对接网址显示
+        
         if self.last_heart_rate is None or heart_rate != self.last_heart_rate:
             timestamp = datetime.now()
             self.heart_rate_recorded.emit(heart_rate, timestamp)
             self.last_heart_rate = heart_rate
+
+    def update_obs_data(self, heart_rate):
+        """更新OBS数据文件"""
+        if self.obs_enabled and hasattr(self, 'obs_file_path') and self.obs_file_path:
+            try:
+                output_type = getattr(self, 'obs_output_type', 'txt')
+                # 确保目录存在
+                import os
+                os.makedirs(os.path.dirname(os.path.abspath(self.obs_file_path)), exist_ok=True)
+                
+                if output_type == 'txt':
+                    # 文本文件输出
+                    with open(self.obs_file_path, 'w') as f:
+                        f.write(str(heart_rate))
+                elif output_type == 'html':
+                    # HTML文件输出
+                    image_path = getattr(self, 'obs_image_path', "")
+                    
+                    # 生成图片HTML
+                    if image_path:
+                        # 确保图片路径是正确的URL格式
+                        import os
+                        absolute_path = os.path.abspath(image_path)
+                        # 转换为file:// URL格式，确保路径正确
+                        file_url = 'file:///' + absolute_path.replace('\\', '/').replace(' ', '%20')
+                        image_html = '<img src="{}" alt="Heart">'.format(file_url)
+                    else:
+                        # 默认心形图标
+                        image_html = '<svg viewBox="0 0 24 24" fill="#E74C3C"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"></path></svg>'
+                    
+                    # 构建HTML内容
+                    html_content = '<!DOCTYPE html>\n'
+                    html_content += '<html>\n'
+                    html_content += '<head>\n'
+                    html_content += '    <meta charset="UTF-8">\n'
+                    html_content += '    <meta name="viewport" content="width=device-width, initial-scale=1.0">\n'
+                    html_content += '    <title>心率显示</title>\n'
+                    html_content += '    <style>\n'
+                    html_content += '        * {\n'
+                    html_content += '            box-sizing: border-box;\n'
+                    html_content += '        }\n'
+                    html_content += '        body {\n'
+                    html_content += '            margin: 0;\n'
+                    html_content += '            padding: 2vh;\n'
+                    html_content += '            font-family: Arial, sans-serif;\n'
+                    html_content += '            display: flex;\n'
+                    html_content += '            align-items: center;\n'
+                    html_content += '            justify-content: center;\n'
+                    html_content += '            background-color: transparent;\n'
+                    html_content += '            height: 100vh;\n'
+                    html_content += '            width: 100vw;\n'
+                    html_content += '        }\n'
+                    html_content += '        .container {\n'
+                    html_content += '            display: flex;\n'
+                    html_content += '            align-items: center;\n'
+                    html_content += '            max-height: 100%;\n'
+                    html_content += '        }\n'
+                    html_content += '        .heart-icon {\n'
+                    html_content += '            margin-right: 4vw;\n'
+                    html_content += '        }\n'
+                    html_content += '        .heart-icon img {\n'
+                    html_content += '            height: 50vh;\n'
+                    html_content += '            width: auto;\n'
+                    html_content += '            object-fit: contain;\n'
+                    html_content += '        }\n'
+                    html_content += '        .heart-icon svg {\n'
+                    html_content += '            height: 50vh;\n'
+                    html_content += '            width: auto;\n'
+                    html_content += '        }\n'
+                    html_content += '        .heart-rate {\n'
+                    html_content += '            font-size: 50vh;\n'
+                    html_content += '            font-weight: bold;\n'
+                    html_content += '            color: #E74C3C;\n'
+                    html_content += '        }\n'
+                    html_content += '        .heart-beat {\n'
+                    html_content += '            animation: beat 1s infinite;\n'
+                    html_content += '        }\n'
+                    html_content += '        @keyframes beat {\n'
+                    html_content += '            0% {\n'
+                    html_content += '                transform: scale(1);\n'
+                    html_content += '            }\n'
+                    html_content += '            14% {\n'
+                    html_content += '                transform: scale(1.3);\n'
+                    html_content += '            }\n'
+                    html_content += '            28% {\n'
+                    html_content += '                transform: scale(1);\n'
+                    html_content += '            }\n'
+                    html_content += '            42% {\n'
+                    html_content += '                transform: scale(1.3);\n'
+                    html_content += '            }\n'
+                    html_content += '            70% {\n'
+                    html_content += '                transform: scale(1);\n'
+                    html_content += '            }\n'
+                    html_content += '        }\n'
+                    html_content += '    </style>\n'
+                    html_content += '    <script>\n'
+                    html_content += '        // 使用JavaScript定期刷新页面\n'
+                    html_content += '        setInterval(function() {\n'
+                    html_content += '            location.reload();\n'
+                    html_content += '        }, 1000); // 每秒刷新一次\n'
+                    html_content += '    </script>\n'
+                    html_content += '</head>\n'
+                    html_content += '<body>\n'
+                    html_content += '    <div class="container">\n'
+                    html_content += '        <div class="heart-icon heart-beat">\n'
+                    html_content += '            ' + image_html + '\n'
+                    html_content += '        </div>\n'
+                    html_content += '        <div class="heart-rate">' + str(heart_rate) + '</div>\n'
+                    html_content += '    </div>\n'
+                    html_content += '</body>\n'
+                    html_content += '</html>\n'
+                    
+                    # 写入HTML文件
+                    with open(self.obs_file_path, 'w', encoding='utf-8') as f:
+                        f.write(html_content)
+            except Exception as e:
+                print(f"OBS文件生成失败: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                from PyQt5.QtWidgets import QMessageBox
+                QMessageBox.warning(self, "OBS文件生成失败", f"无法生成OBS文件: {str(e)}")
 
     def update_calories(self):
         if self.start_time and self.current_heart_rate > 0 and self.calorie_settings['enabled']:
@@ -468,6 +750,62 @@ class HomePage(QWidget):
             seconds = int(elapsed % 60)
             self.duration_label.setText(f"运动时长: {hours:02d}:{minutes:02d}:{seconds:02d}")
 
+    def update_rr_intervals(self, rr_intervals):
+        self.using_real_rr = True
+        for rr in rr_intervals:
+            self.real_rr_intervals.append(rr)
+            if len(self.real_rr_intervals) > self.hrv_window_size:
+                self.real_rr_intervals.pop(0)
+        self.update_hrv()
+
+    def update_hrv(self):
+        if self.using_real_rr and len(self.real_rr_intervals) >= 5:
+            rr_intervals = self.real_rr_intervals.copy()
+            source_text = "(真实RR间期)"
+        elif len(self.heart_rate_timestamps) >= 5:
+            rr_intervals = []
+            for hr, _ in self.heart_rate_timestamps:
+                if hr > 0:
+                    rr_interval = 60000.0 / hr
+                    rr_intervals.append(rr_interval)
+            source_text = "(心率推算)"
+        else:
+            self.hrv_value_label.setText("RMSSD: -- ms")
+            self.hrv_status_label.setText("状态: 等待更多数据...")
+            self.hrv_status_label.setStyleSheet("color: #7F8C8D;")
+            self.hrv_bar.setStyleSheet("background-color: #E0E0E0; border-radius: 4px;")
+            return
+        
+        if len(rr_intervals) < 5:
+            return
+        
+        squared_diffs = []
+        for i in range(1, len(rr_intervals)):
+            diff = rr_intervals[i] - rr_intervals[i-1]
+            squared_diffs.append(diff ** 2)
+        
+        if squared_diffs:
+            rmssd = (sum(squared_diffs) / len(squared_diffs)) ** 0.5
+        else:
+            return
+        
+        self.hrv_value_label.setText(f"RMSSD: {rmssd:.1f} ms {source_text}")
+        
+        status, color, bar_color = self.get_hrv_status(rmssd)
+        self.hrv_status_label.setText(f"状态: {status}")
+        self.hrv_status_label.setStyleSheet(f"color: {color};")
+        self.hrv_bar.setStyleSheet(f"background-color: {bar_color}; border-radius: 4px;")
+
+    def get_hrv_status(self, rmssd):
+        if rmssd >= 100:
+            return "优秀 - 恢复良好，压力低", "#27AE60", "#27AE60"
+        elif rmssd >= 50:
+            return "良好 - 身体状态正常", "#3498DB", "#3498DB"
+        elif rmssd >= 20:
+            return "一般 - 有一定压力", "#F39C12", "#F39C12"
+        else:
+            return "较低 - 压力大，建议休息", "#E74C3C", "#E74C3C"
+
     def update_status(self, status):
         self.status_label.setText(status)
 
@@ -475,8 +813,118 @@ class HomePage(QWidget):
         QMessageBox.warning(self, "错误", message)
         self.stop_receiving()
 
+    def update_hrv_visibility(self, visible):
+        self.hrv_frame.setVisible(visible)
+
+    def copy_obs_url(self):
+        """复制OBS对接网址到剪贴板"""
+        from PyQt5.QtWidgets import QApplication, QMessageBox
+        clipboard = QApplication.clipboard()
+        clipboard.setText(self.obs_url_display.text())
+        QMessageBox.information(self, "复制成功", "OBS对接网址已复制到剪贴板")
+
+    def update_obs_url_display(self):
+        """更新OBS对接网址显示"""
+        if self.obs_enabled and self.obs_file_path:
+            import os
+            # 生成文件的绝对路径URL
+            file_url = f"file:///{os.path.abspath(self.obs_file_path).replace('\\', '/')}"
+            self.obs_url_display.setText(file_url)
+            self.obs_url_frame.show()
+        else:
+            self.obs_url_frame.hide()
+
     def cleanup(self):
         self.stop_receiving()
+
+
+class StatsWindow(QWidget):
+    def __init__(self, record_page, parent=None):
+        super().__init__(parent)
+        self.record_page = record_page
+        self.setWindowTitle("心率统计面板")
+        self.setMinimumSize(350, 300)
+        self.init_ui()
+        
+        self.update_timer = QTimer()
+        self.update_timer.timeout.connect(self.update_stats)
+        self.update_timer.start(500)
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(20)
+        
+        title_label = QLabel("心率统计")
+        title_label.setFont(QFont("Arial", 18, QFont.Bold))
+        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setStyleSheet("color: #2C3E50; margin: 10px;")
+        layout.addWidget(title_label)
+        
+        stats_frame = QGroupBox()
+        stats_frame.setStyleSheet("""
+            QGroupBox {
+                background-color: white;
+                border: 2px solid #BDC3C7;
+                border-radius: 10px;
+                margin-top: 10px;
+                padding: 15px;
+            }
+        """)
+        stats_layout = QVBoxLayout(stats_frame)
+        stats_layout.setSpacing(15)
+        
+        self.max_label = QLabel("最大心率: -- BPM")
+        self.max_label.setFont(QFont("Arial", 14))
+        self.max_label.setStyleSheet("color: #E74C3C;")
+        stats_layout.addWidget(self.max_label)
+        
+        self.min_label = QLabel("最小心率: -- BPM")
+        self.min_label.setFont(QFont("Arial", 14))
+        self.min_label.setStyleSheet("color: #3498DB;")
+        stats_layout.addWidget(self.min_label)
+        
+        self.avg_label = QLabel("平均心率: -- BPM")
+        self.avg_label.setFont(QFont("Arial", 14))
+        self.avg_label.setStyleSheet("color: #2ECC71;")
+        stats_layout.addWidget(self.avg_label)
+        
+        self.count_label = QLabel("记录数量: 0")
+        self.count_label.setFont(QFont("Arial", 14))
+        self.count_label.setStyleSheet("color: #9B59B6;")
+        stats_layout.addWidget(self.count_label)
+        
+        layout.addWidget(stats_frame)
+        
+        self.range_label = QLabel("心率范围: --")
+        self.range_label.setFont(QFont("Arial", 12))
+        self.range_label.setAlignment(Qt.AlignCenter)
+        self.range_label.setStyleSheet("color: #7F8C8D; margin: 10px;")
+        layout.addWidget(self.range_label)
+
+    def update_stats(self):
+        records = self.record_page.records
+        if not records:
+            self.max_label.setText("最大心率: -- BPM")
+            self.min_label.setText("最小心率: -- BPM")
+            self.avg_label.setText("平均心率: -- BPM")
+            self.count_label.setText("记录数量: 0")
+            self.range_label.setText("心率范围: --")
+            return
+        
+        heart_rates = [r.heart_rate for r in records]
+        max_hr = max(heart_rates)
+        min_hr = min(heart_rates)
+        avg_hr = sum(heart_rates) / len(heart_rates)
+        
+        self.max_label.setText(f"最大心率: {max_hr} BPM")
+        self.min_label.setText(f"最小心率: {min_hr} BPM")
+        self.avg_label.setText(f"平均心率: {avg_hr:.1f} BPM")
+        self.count_label.setText(f"记录数量: {len(records)}")
+        self.range_label.setText(f"心率范围: {min_hr} - {max_hr} BPM (波动 {max_hr - min_hr} BPM)")
+
+    def closeEvent(self, event):
+        self.update_timer.stop()
+        event.accept()
 
 
 class ChartWindow(QWidget):
@@ -557,6 +1005,7 @@ class RecordPage(QWidget):
         super().__init__(parent)
         self.records = []
         self.chart_window = None
+        self.stats_window = None
         self.init_ui()
 
     def init_ui(self):
@@ -618,6 +1067,23 @@ class RecordPage(QWidget):
         chart_button.clicked.connect(self.show_chart)
         button_layout.addWidget(chart_button)
         
+        stats_button = QPushButton("统计面板")
+        stats_button.setFont(QFont("Arial", 12))
+        stats_button.setMinimumSize(100, 35)
+        stats_button.setStyleSheet("""
+            QPushButton {
+                background-color: #9B59B6;
+                color: white;
+                border: none;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #8E44AD;
+            }
+        """)
+        stats_button.clicked.connect(self.show_stats)
+        button_layout.addWidget(stats_button)
+        
         button_layout.addStretch()
         
         clear_button = QPushButton("清空记录")
@@ -648,6 +1114,15 @@ class RecordPage(QWidget):
             self.chart_window.raise_()
             self.chart_window.activateWindow()
 
+    def show_stats(self):
+        if self.stats_window is None or not self.stats_window.isVisible():
+            self.stats_window = StatsWindow(self)
+            self.stats_window.setWindowTitle("心率统计面板")
+            self.stats_window.show()
+        else:
+            self.stats_window.raise_()
+            self.stats_window.activateWindow()
+
     def add_record(self, heart_rate, timestamp):
         record = HeartRateRecord(heart_rate, timestamp)
         self.records.append(record)
@@ -670,6 +1145,9 @@ class RecordPage(QWidget):
 class HeartRateWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.show_hrv = False  # 默认关闭HRV
+        self.obs_enabled = False  # 默认关闭OBS对接
+        self.obs_file_path = "obs_heart_rate.txt"  # OBS数据文件路径
         self.init_ui()
 
     def init_ui(self):
@@ -703,18 +1181,6 @@ class HeartRateWindow(QMainWindow):
                 background-color: #3498DB;
             }
         """)
-        
-        settings_menu = menubar.addMenu("设置")
-        
-        calorie_action = QAction("显示动态实时卡路里", self)
-        calorie_action.triggered.connect(self.show_calorie_settings)
-        settings_menu.addAction(calorie_action)
-        
-        settings_menu.addSeparator()
-        
-        update_action = QAction("检查更新", self)
-        update_action.triggered.connect(self.check_update)
-        settings_menu.addAction(update_action)
         
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -781,18 +1247,307 @@ class HeartRateWindow(QMainWindow):
         
         self.home_page = HomePage()
         self.home_page.heart_rate_recorded.connect(self.on_heart_rate_recorded)
+        self.home_page.update_hrv_visibility(self.show_hrv)  # 初始化HRV可见性
+        self.set_obs_settings()  # 初始化OBS设置
         self.stack.addWidget(self.home_page)
         
         self.record_page = RecordPage()
         self.stack.addWidget(self.record_page)
         
         main_layout.addWidget(self.stack)
+        
+        settings_menu = menubar.addMenu("设置")
+        
+        # 显示动态实时卡路里选项
+        self.calorie_action = QAction("显示动态实时卡路里", self)
+        self.calorie_action.triggered.connect(self.show_calorie_settings)
+        settings_menu.addAction(self.calorie_action)
+        
+        # 在设置菜单中添加HRV控制选项
+        self.hrv_action = QAction("关闭心率变异性（HRV）" if self.show_hrv else "显示心率变异性（HRV）", self)
+        self.hrv_action.triggered.connect(lambda: self.toggle_hrv())
+        settings_menu.addAction(self.hrv_action)
+        
+        # 在设置菜单中添加OBS对接选项
+        self.obs_action = QAction("对接OBS", self)
+        self.obs_action.triggered.connect(self.show_obs_settings)
+        settings_menu.addAction(self.obs_action)
+        
+        settings_menu.addSeparator()
+        
+        update_action = QAction("检查更新", self)
+        update_action.triggered.connect(self.check_update)
+        settings_menu.addAction(update_action)
+        
+        data_menu = menubar.addMenu("数据")
+        
+        export_csv_action = QAction("导出为 CSV", self)
+        export_csv_action.triggered.connect(self.export_to_csv)
+        data_menu.addAction(export_csv_action)
+        
+        export_excel_action = QAction("导出为 Excel", self)
+        export_excel_action.triggered.connect(self.export_to_excel)
+        data_menu.addAction(export_excel_action)
+        
+        # 延迟执行更新检查，确保UI已加载
+        from PyQt5.QtCore import QTimer
+        QTimer.singleShot(1000, self.check_update_at_startup)
 
     def show_calorie_settings(self):
         dialog = CalorieSettingsDialog(self, self.home_page.get_calorie_settings())
         if dialog.exec_() == QDialog.Accepted:
             settings = dialog.get_settings()
             self.home_page.set_calorie_settings(settings)
+            # 更新菜单项文本
+            if settings['enabled']:
+                self.calorie_action.setText("关闭动态实时卡路里")
+            else:
+                self.calorie_action.setText("显示动态实时卡路里")
+
+    def show_obs_settings(self):
+        """显示OBS对接设置对话框"""
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, QPushButton, QFileDialog, QLineEdit, QGroupBox, QComboBox
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("OBS对接设置")
+        dialog.setMinimumWidth(600)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # 启用OBS对接选项
+        self.obs_checkbox = QCheckBox("启用OBS对接")
+        self.obs_checkbox.setChecked(self.obs_enabled)
+        self.obs_checkbox.setStyleSheet("font-weight: bold; color: #2C3E50;")
+        layout.addWidget(self.obs_checkbox)
+        
+        layout.addSpacing(10)
+        
+        # 输出方式选择
+        output_group = QGroupBox("输出方式")
+        output_layout = QVBoxLayout(output_group)
+        
+        self.output_type_combo = QComboBox()
+        self.output_type_combo.addItem("文本文件 (简单数字)", "txt")
+        self.output_type_combo.addItem("HTML文件 (带图片/动画)", "html")
+        self.output_type_combo.setCurrentIndex(0 if not hasattr(self, 'obs_output_type') or self.obs_output_type == 'txt' else 1)
+        self.output_type_combo.currentIndexChanged.connect(self.on_output_type_changed)
+        output_layout.addWidget(QLabel("选择输出方式:"))
+        output_layout.addWidget(self.output_type_combo)
+        
+        layout.addWidget(output_group)
+        
+        layout.addSpacing(10)
+        
+        # 文件路径设置
+        file_group = QGroupBox("数据文件设置")
+        file_layout = QVBoxLayout(file_group)
+        
+        path_layout = QHBoxLayout()
+        path_label = QLabel("数据文件路径:")
+        self.obs_path_edit = QLineEdit(self.obs_file_path)
+        browse_button = QPushButton("浏览...")
+        browse_button.clicked.connect(self.browse_obs_file)
+        
+        path_layout.addWidget(path_label)
+        path_layout.addWidget(self.obs_path_edit, 1)
+        path_layout.addWidget(browse_button)
+        
+        file_layout.addLayout(path_layout)
+        
+        # 图片设置
+        image_layout = QHBoxLayout()
+        image_label = QLabel("心率图标路径:")
+        self.obs_image_edit = QLineEdit(getattr(self, 'obs_image_path', ""))
+        image_browse_button = QPushButton("浏览...")
+        image_browse_button.clicked.connect(self.browse_obs_image)
+        
+        image_layout.addWidget(image_label)
+        image_layout.addWidget(self.obs_image_edit, 1)
+        image_layout.addWidget(image_browse_button)
+        
+        file_layout.addLayout(image_layout)
+        
+        info_label = QLabel("OBS可以通过读取此文件来获取实时心率数据")
+        info_label.setStyleSheet("color: #7F8C8D; font-size: 24px;")
+        file_layout.addWidget(info_label)
+        
+        html_info_label = QLabel("使用HTML输出时，OBS需添加浏览器源并指向生成的HTML文件")
+        html_info_label.setStyleSheet("color: #3498DB; font-size: 24px;")
+        file_layout.addWidget(html_info_label)
+        
+        layout.addWidget(file_group)
+        
+        layout.addSpacing(20)
+        
+        # 使用说明部分
+        usage_group = QGroupBox("使用说明")
+        usage_layout = QVBoxLayout(usage_group)
+        
+        usage_steps = [
+            "1. 启用OBS对接功能",
+            "2. 选择输出方式（文本文件或HTML文件）",
+            "3. 设置数据文件保存路径",
+            "4. 选择自定义心率图标（仅HTML输出方式）",
+            "5. 开始接收心率数据",
+            "6. 在OBS中添加相应的源：",
+            "   - 文本文件：添加文本源，指向生成的txt文件",
+            "   - HTML文件：添加浏览器源，指向生成的HTML文件",
+            "7. 调整源的大小和位置"
+        ]
+        
+        for step in usage_steps:
+            step_label = QLabel(step)
+            step_label.setStyleSheet("color: #2C3E50; font-size: 16px;")
+            usage_layout.addWidget(step_label)
+        
+        layout.addWidget(usage_group)
+        
+        layout.addSpacing(20)
+        
+        # 按钮布局
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        
+        cancel_button = QPushButton("取消")
+        cancel_button.setMinimumWidth(80)
+        cancel_button.setStyleSheet("""
+            QPushButton {
+                background-color: #95A5A6;
+                color: white;
+                border: none;
+                border-radius: 5px;
+                padding: 8px;
+            }
+            QPushButton:hover {
+                background-color: #7F8C8D;
+            }
+        """)
+        cancel_button.clicked.connect(dialog.reject)
+        button_layout.addWidget(cancel_button)
+        
+        ok_button = QPushButton("确定")
+        ok_button.setMinimumWidth(80)
+        ok_button.setStyleSheet("""
+            QPushButton {
+                background-color: #27AE60;
+                color: white;
+                border: none;
+                border-radius: 5px;
+                padding: 8px;
+            }
+            QPushButton:hover {
+                background-color: #2ECC71;
+            }
+        """)
+        ok_button.clicked.connect(lambda: self.save_obs_settings(dialog))
+        button_layout.addWidget(ok_button)
+        
+        layout.addLayout(button_layout)
+        
+        dialog.exec_()
+
+    def browse_obs_file(self):
+        """浏览OBS数据文件路径"""
+        # 使用对话框中当前选择的输出类型
+        if hasattr(self, 'output_type_combo'):
+            output_type = self.output_type_combo.currentData()
+        else:
+            output_type = getattr(self, 'obs_output_type', 'txt')
+        
+        # 更新初始文件名，确保后缀与输出类型匹配
+        import os
+        initial_file_path = self.obs_file_path
+        if initial_file_path:
+            base_name = os.path.splitext(initial_file_path)[0]
+            initial_file_path = f"{base_name}.{output_type}"
+        
+        file_filter = "文本文件 (*.txt)" if output_type == 'txt' else "HTML文件 (*.html)"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "保存OBS数据文件", 
+            initial_file_path,
+            file_filter
+        )
+        if file_path:
+            # 确保文件后缀与选择的输出类型匹配
+            base_name = os.path.splitext(file_path)[0]
+            new_file_path = f"{base_name}.{output_type}"
+            self.obs_path_edit.setText(new_file_path)
+
+    def browse_obs_image(self):
+        """浏览心率图标路径"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "选择心率图标", 
+            "",
+            "图片文件 (*.png *.jpg *.jpeg *.gif)"
+        )
+        if file_path:
+            self.obs_image_edit.setText(file_path)
+
+    def on_output_type_changed(self, index):
+        """当输出类型改变时，更新文件路径扩展名"""
+        output_type = self.output_type_combo.currentData()
+        current_path = self.obs_path_edit.text()
+        
+        if current_path:
+            # 移除旧的扩展名
+            import os
+            base_name = os.path.splitext(current_path)[0]
+            # 添加新的扩展名
+            new_path = f"{base_name}.{output_type}"
+            self.obs_path_edit.setText(new_path)
+
+    def save_obs_settings(self, dialog):
+        """保存OBS设置"""
+        self.obs_enabled = self.obs_checkbox.isChecked()
+        self.obs_file_path = self.obs_path_edit.text()
+        self.obs_output_type = self.output_type_combo.currentData()
+        self.obs_image_path = self.obs_image_edit.text()
+        
+        # 更新菜单项文本
+        if self.obs_enabled:
+            self.obs_action.setText("关闭OBS对接")
+        else:
+            self.obs_action.setText("对接OBS")
+        
+        # 向HomePage传递OBS设置
+        self.set_obs_settings()
+        
+        dialog.accept()
+
+    def set_obs_settings(self):
+        """向HomePage传递OBS设置"""
+        self.home_page.obs_enabled = self.obs_enabled
+        self.home_page.obs_file_path = self.obs_file_path
+        self.home_page.obs_output_type = getattr(self, 'obs_output_type', 'txt')
+        self.home_page.obs_image_path = getattr(self, 'obs_image_path', "")
+        # 更新OBS对接网址显示
+        self.home_page.update_obs_url_display()
+
+    def version_compare(self, v1, v2):
+        """比较两个版本号的大小
+        返回 1 如果 v1 > v2
+        返回 0 如果 v1 == v2
+        返回 -1 如果 v1 < v2
+        """
+        # 移除版本号前缀的 'v'
+        v1 = v1.lstrip('v')
+        v2 = v2.lstrip('v')
+        
+        # 分割版本号为数字列表
+        v1_parts = list(map(int, v1.split('.')))
+        v2_parts = list(map(int, v2.split('.')))
+        
+        # 比较每个部分
+        for i in range(max(len(v1_parts), len(v2_parts))):
+            v1_part = v1_parts[i] if i < len(v1_parts) else 0
+            v2_part = v2_parts[i] if i < len(v2_parts) else 0
+            
+            if v1_part > v2_part:
+                return 1
+            elif v1_part < v2_part:
+                return -1
+        
+        return 0
 
     def check_update(self):
         try:
@@ -809,7 +1564,7 @@ class HeartRateWindow(QMainWindow):
                 QMessageBox.warning(self, "检查更新", "无法获取版本信息")
                 return
             
-            if latest_version == APP_VERSION:
+            if self.version_compare(APP_VERSION, latest_version) >= 0:
                 QMessageBox.information(
                     self, "检查更新",
                     f"当前已是最新版本\n\n当前版本: {APP_VERSION}"
@@ -844,6 +1599,138 @@ class HeartRateWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "检查更新", f"检查更新失败: {str(e)}")
 
+    def check_update_at_startup(self):
+        try:
+            req = urllib.request.Request(GITHUB_RELEASES_API)
+            req.add_header('User-Agent', f'HeartRateReceiver/{APP_VERSION}')
+            
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                latest_version = data.get('tag_name', '')
+                release_url = data.get('html_url', '')
+                release_notes = data.get('body', '')
+            
+            if not latest_version:
+                return
+            
+            if self.version_compare(APP_VERSION, latest_version) < 0:
+                msg = f"发现新版本!\n\n当前版本: {APP_VERSION}\n最新版本: {latest_version}"
+                if release_notes:
+                    msg += f"\n\n更新内容:\n{release_notes[:200]}"
+                    if len(release_notes) > 200:
+                        msg += "..."
+                
+                msg += "\n\n⚠️  强制更新：请更新到最新版本后再使用。"
+                
+                reply = QMessageBox.critical(
+                    self, "强制更新", msg,
+                    QMessageBox.Ok | QMessageBox.Cancel,
+                    QMessageBox.Ok
+                )
+                
+                if reply == QMessageBox.Ok and release_url:
+                    import webbrowser
+                    webbrowser.open(release_url)
+                
+                # 无论用户选择什么，都退出软件
+                QApplication.instance().quit()
+                
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                pass
+        except urllib.error.URLError as e:
+            pass
+        except Exception as e:
+            pass
+
+    def export_to_csv(self):
+        records = self.record_page.records
+        if not records:
+            QMessageBox.warning(self, "导出数据", "没有数据可导出")
+            return
+        
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "导出为 CSV", 
+            f"心率记录_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            "CSV文件 (*.csv)"
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            with open(file_path, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                writer.writerow(['序号', '心率 (BPM)', '时间'])
+                for i, record in enumerate(records, 1):
+                    writer.writerow([
+                        i,
+                        record.heart_rate,
+                        record.timestamp.strftime('%Y-%m-%d %H:%M:%S')
+                    ])
+            
+            QMessageBox.information(self, "导出成功", f"数据已导出到:\n{file_path}")
+        except Exception as e:
+            QMessageBox.warning(self, "导出失败", f"导出失败: {str(e)}")
+
+    def export_to_excel(self):
+        records = self.record_page.records
+        if not records:
+            QMessageBox.warning(self, "导出数据", "没有数据可导出")
+            return
+        
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "导出为 Excel",
+            f"心率记录_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            "Excel文件 (*.xlsx)"
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+            
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "心率记录"
+            
+            header_font = Font(bold=True, color="FFFFFF")
+            header_fill = PatternFill(start_color="34495E", end_color="34495E", fill_type="solid")
+            header_alignment = Alignment(horizontal="center", vertical="center")
+            thin_border = Border(
+                left=Side(style='thin'),
+                right=Side(style='thin'),
+                top=Side(style='thin'),
+                bottom=Side(style='thin')
+            )
+            
+            headers = ['序号', '心率 (BPM)', '时间']
+            for col, header in enumerate(headers, 1):
+                cell = ws.cell(row=1, column=col, value=header)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = header_alignment
+                cell.border = thin_border
+            
+            for i, record in enumerate(records, 1):
+                ws.cell(row=i+1, column=1, value=i).border = thin_border
+                ws.cell(row=i+1, column=2, value=record.heart_rate).border = thin_border
+                ws.cell(row=i+1, column=3, value=record.timestamp.strftime('%Y-%m-%d %H:%M:%S')).border = thin_border
+            
+            ws.column_dimensions['A'].width = 10
+            ws.column_dimensions['B'].width = 15
+            ws.column_dimensions['C'].width = 25
+            
+            wb.save(file_path)
+            
+            QMessageBox.information(self, "导出成功", f"数据已导出到:\n{file_path}")
+        except ImportError:
+            QMessageBox.warning(self, "导出失败", "请先安装 openpyxl 库:\npip install openpyxl")
+        except Exception as e:
+            QMessageBox.warning(self, "导出失败", f"导出失败: {str(e)}")
+
     def switch_page(self, index):
         self.stack.setCurrentIndex(index)
         self.home_button.setChecked(index == 0)
@@ -851,6 +1738,15 @@ class HeartRateWindow(QMainWindow):
 
     def on_heart_rate_recorded(self, heart_rate, timestamp):
         self.record_page.add_record(heart_rate, timestamp)
+
+    def toggle_hrv(self):
+        # 切换HRV状态
+        self.show_hrv = not self.show_hrv
+        self.home_page.update_hrv_visibility(self.show_hrv)
+        if self.show_hrv:
+            self.hrv_action.setText("关闭心率变异性（HRV）")
+        else:
+            self.hrv_action.setText("显示心率变异性（HRV）")
 
     def closeEvent(self, event):
         self.home_page.cleanup()
