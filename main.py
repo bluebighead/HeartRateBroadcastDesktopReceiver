@@ -1,6 +1,9 @@
 import sys
 import asyncio
 import time
+import json
+import urllib.request
+import urllib.error
 from datetime import datetime
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -13,6 +16,10 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPropertyAnimation, QE
 from PyQt5.QtGui import QFont
 from bleak import BleakClient, BleakScanner
 import pyqtgraph as pg
+
+APP_VERSION = "v1.0.0"
+GITHUB_REPO = "bluebighead/HeartRateBroadcastDesktopReceiver"
+GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
 HEART_RATE_SERVICE_UUID = "0000180D-0000-1000-8000-00805F9B34FB"
 HEART_RATE_MEASUREMENT_UUID = "00002A37-0000-1000-8000-00805F9B34FB"
@@ -666,7 +673,7 @@ class HeartRateWindow(QMainWindow):
         self.init_ui()
 
     def init_ui(self):
-        self.setWindowTitle("心率广播接收器")
+        self.setWindowTitle(f"心率广播接收器 {APP_VERSION}")
         self.setMinimumSize(500, 400)
         
         menubar = self.menuBar()
@@ -702,6 +709,12 @@ class HeartRateWindow(QMainWindow):
         calorie_action = QAction("显示动态实时卡路里", self)
         calorie_action.triggered.connect(self.show_calorie_settings)
         settings_menu.addAction(calorie_action)
+        
+        settings_menu.addSeparator()
+        
+        update_action = QAction("检查更新", self)
+        update_action.triggered.connect(self.check_update)
+        settings_menu.addAction(update_action)
         
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -780,6 +793,56 @@ class HeartRateWindow(QMainWindow):
         if dialog.exec_() == QDialog.Accepted:
             settings = dialog.get_settings()
             self.home_page.set_calorie_settings(settings)
+
+    def check_update(self):
+        try:
+            req = urllib.request.Request(GITHUB_RELEASES_API)
+            req.add_header('User-Agent', f'HeartRateReceiver/{APP_VERSION}')
+            
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                latest_version = data.get('tag_name', '')
+                release_url = data.get('html_url', '')
+                release_notes = data.get('body', '')
+            
+            if not latest_version:
+                QMessageBox.warning(self, "检查更新", "无法获取版本信息")
+                return
+            
+            if latest_version == APP_VERSION:
+                QMessageBox.information(
+                    self, "检查更新",
+                    f"当前已是最新版本\n\n当前版本: {APP_VERSION}"
+                )
+            else:
+                msg = f"发现新版本!\n\n当前版本: {APP_VERSION}\n最新版本: {latest_version}"
+                if release_notes:
+                    msg += f"\n\n更新内容:\n{release_notes[:200]}"
+                    if len(release_notes) > 200:
+                        msg += "..."
+                
+                reply = QMessageBox.question(
+                    self, "检查更新", msg,
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+                
+                if reply == QMessageBox.Yes and release_url:
+                    import webbrowser
+                    webbrowser.open(release_url)
+                    
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                QMessageBox.information(
+                    self, "检查更新",
+                    f"当前版本: {APP_VERSION}\n\n暂无发布版本\n\n请前往 GitHub 发布第一个版本"
+                )
+            else:
+                QMessageBox.warning(self, "检查更新", f"HTTP错误: {e.code} {e.reason}")
+        except urllib.error.URLError as e:
+            QMessageBox.warning(self, "检查更新", f"网络错误: {str(e)}\n\n请检查网络连接")
+        except Exception as e:
+            QMessageBox.warning(self, "检查更新", f"检查更新失败: {str(e)}")
 
     def switch_page(self, index):
         self.stack.setCurrentIndex(index)
