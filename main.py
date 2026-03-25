@@ -12,14 +12,15 @@ from PyQt5.QtWidgets import (
     QLabel, QPushButton, QMessageBox, QStackedWidget, QTableWidget,
     QTableWidgetItem, QHeaderView, QAbstractItemView, QGraphicsOpacityEffect,
     QDialog, QCheckBox, QLineEdit, QComboBox, QSpinBox, QFormLayout,
-    QMenuBar, QAction, QGroupBox, QFileDialog, QTabWidget, QTextEdit
+    QMenuBar, QAction, QGroupBox, QFileDialog, QTabWidget, QTextEdit,
+    QProgressBar
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, pyqtProperty
 from PyQt5.QtGui import QFont
 from bleak import BleakClient, BleakScanner
 import pyqtgraph as pg
 
-APP_VERSION = "v1.0.1"
+APP_VERSION = "v1.0.2"
 GITHUB_REPO = "bluebighead/HeartRateBroadcastDesktopReceiver"
 GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -909,6 +910,9 @@ class StatsWindow(QWidget):
         self.setMinimumSize(350, 300)
         self.init_ui()
         
+        # 加载保存的体重设置
+        self.load_weight_setting()
+        
         self.update_timer = QTimer()
         self.update_timer.timeout.connect(self.update_stats)
         self.update_timer.start(500)
@@ -956,6 +960,29 @@ class StatsWindow(QWidget):
         self.count_label.setStyleSheet("color: #9B59B6;")
         stats_layout.addWidget(self.count_label)
         
+        # 体重输入
+        weight_layout = QHBoxLayout()
+        weight_label = QLabel("体重 (kg):")
+        weight_label.setFont(QFont("Arial", 14))
+        weight_label.setStyleSheet("color: #3498DB;")
+        weight_layout.addWidget(weight_label)
+        
+        self.weight_input = QLineEdit()
+        self.weight_input.setFont(QFont("Arial", 14))
+        self.weight_input.setFixedWidth(80)
+        self.weight_input.setAlignment(Qt.AlignCenter)
+        self.weight_input.setText("70")  # 默认体重
+        self.weight_input.textChanged.connect(self.on_weight_changed)
+        weight_layout.addWidget(self.weight_input)
+        
+        stats_layout.addLayout(weight_layout)
+        
+        # 卡路里总消耗
+        self.calories_label = QLabel("卡路里总消耗: 0.0 kcal")
+        self.calories_label.setFont(QFont("Arial", 14))
+        self.calories_label.setStyleSheet("color: #F39C12;")
+        stats_layout.addWidget(self.calories_label)
+        
         layout.addWidget(stats_frame)
         
         self.range_label = QLabel("心率范围: --")
@@ -971,6 +998,7 @@ class StatsWindow(QWidget):
             self.min_label.setText("最小心率: -- BPM")
             self.avg_label.setText("平均心率: -- BPM")
             self.count_label.setText("记录数量: 0")
+            self.calories_label.setText("卡路里总消耗: 0.0 kcal")
             self.range_label.setText("心率范围: --")
             return
         
@@ -979,11 +1007,85 @@ class StatsWindow(QWidget):
         min_hr = min(heart_rates)
         avg_hr = sum(heart_rates) / len(heart_rates)
         
+        # 计算卡路里总消耗
+        total_calories = 0.0
+        # 假设每记录间隔为1分钟，使用简化的卡路里计算公式
+        # 卡路里 = 0.014 * 体重(kg) * 心率 * 时间(分钟)
+        # 获取用户输入的体重
+        try:
+            weight = float(self.weight_input.text())
+        except ValueError:
+            weight = 70  # 默认体重
+        for i in range(len(records) - 1):
+            current_hr = records[i].heart_rate
+            next_hr = records[i+1].heart_rate
+            # 计算平均心率
+            avg_hr_interval = (current_hr + next_hr) / 2
+            # 计算时间差（分钟）
+            time_diff = (records[i+1].timestamp - records[i].timestamp).total_seconds() / 60
+            # 计算卡路里消耗
+            calories = 0.014 * weight * avg_hr_interval * time_diff
+            total_calories += calories
+        
         self.max_label.setText(f"最大心率: {max_hr} BPM")
         self.min_label.setText(f"最小心率: {min_hr} BPM")
         self.avg_label.setText(f"平均心率: {avg_hr:.1f} BPM")
         self.count_label.setText(f"记录数量: {len(records)}")
+        self.calories_label.setText(f"卡路里总消耗: {total_calories:.1f} kcal")
         self.range_label.setText(f"心率范围: {min_hr} - {max_hr} BPM (波动 {max_hr - min_hr} BPM)")
+
+    def on_weight_changed(self):
+        """处理体重输入变化"""
+        # 保存体重设置
+        self.save_weight_setting()
+        # 更新统计信息
+        self.update_stats()
+    
+    def load_weight_setting(self):
+        """加载保存的体重设置"""
+        import os
+        import json
+        
+        # 保存设置的文件路径
+        settings_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+        
+        try:
+            if os.path.exists(settings_file):
+                with open(settings_file, 'r', encoding='utf-8') as f:
+                    settings = json.load(f)
+                    if 'weight' in settings:
+                        self.weight_input.setText(str(settings['weight']))
+        except Exception as e:
+            print(f"加载体重设置失败: {str(e)}")
+    
+    def save_weight_setting(self):
+        """保存体重设置"""
+        import os
+        import json
+        
+        # 保存设置的文件路径
+        settings_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+        
+        try:
+            # 获取当前体重输入
+            weight_text = self.weight_input.text()
+            if weight_text and weight_text.replace('.', '').isdigit():
+                weight = float(weight_text)
+                
+                # 读取现有设置
+                settings = {}
+                if os.path.exists(settings_file):
+                    with open(settings_file, 'r', encoding='utf-8') as f:
+                        settings = json.load(f)
+                
+                # 更新体重设置
+                settings['weight'] = weight
+                
+                # 保存设置
+                with open(settings_file, 'w', encoding='utf-8') as f:
+                    json.dump(settings, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"保存体重设置失败: {str(e)}")
 
     def closeEvent(self, event):
         self.update_timer.stop()
@@ -1376,6 +1478,16 @@ class SleepAnalysisWindow(QWidget):
         self.sleep_duration_label.setFont(QFont("Arial", 12))
         analysis_layout.addWidget(self.sleep_duration_label)
         
+        # 入睡时间
+        self.sleep_start_label = QLabel("入睡时间：")
+        self.sleep_start_label.setFont(QFont("Arial", 12))
+        analysis_layout.addWidget(self.sleep_start_label)
+        
+        # 清醒时间
+        self.sleep_end_label = QLabel("清醒时间：")
+        self.sleep_end_label.setFont(QFont("Arial", 12))
+        analysis_layout.addWidget(self.sleep_end_label)
+        
         # 深睡比例
         self.deep_sleep_label = QLabel("深睡比例：")
         self.deep_sleep_label.setFont(QFont("Arial", 12))
@@ -1407,6 +1519,34 @@ class SleepAnalysisWindow(QWidget):
         
         chart_layout.addWidget(self.chart_widget)
         layout.addWidget(chart_group)
+        
+        # 睡眠状态分布
+        pie_chart_group = QGroupBox("睡眠状态分布")
+        pie_chart_layout = QVBoxLayout(pie_chart_group)
+        
+        # 使用水平进度条显示睡眠状态分布
+        self.sleep_distribution_layout = QVBoxLayout()
+        
+        # 创建三个进度条，分别对应清醒、浅睡、深睡
+        self.awake_bar = QProgressBar()
+        self.awake_bar.setStyleSheet("QProgressBar::chunk { background-color: #E74C3C; }")
+        self.awake_bar.setFormat("清醒: 0%")
+        
+        self.light_sleep_bar = QProgressBar()
+        self.light_sleep_bar.setStyleSheet("QProgressBar::chunk { background-color: #F39C12; }")
+        self.light_sleep_bar.setFormat("浅睡: 0%")
+        
+        self.deep_sleep_bar = QProgressBar()
+        self.deep_sleep_bar.setStyleSheet("QProgressBar::chunk { background-color: #27AE60; }")
+        self.deep_sleep_bar.setFormat("深睡: 0%")
+        
+        self.sleep_distribution_layout.addWidget(self.awake_bar)
+        self.sleep_distribution_layout.addWidget(self.light_sleep_bar)
+        self.sleep_distribution_layout.addWidget(self.deep_sleep_bar)
+        
+        pie_chart_layout.addLayout(self.sleep_distribution_layout)
+        
+        layout.addWidget(pie_chart_group)
         
         # 改善建议
         advice_group = QGroupBox("改善建议")
@@ -1598,6 +1738,13 @@ class SleepAnalysisWindow(QWidget):
         duration_hours = sleep_quality['duration_minutes'] / 60
         self.sleep_duration_label.setText(f"睡眠时长：{duration_hours:.1f} 小时")
         
+        # 更新入睡时间和清醒时间
+        if records:
+            sleep_start_time = records[0].timestamp.strftime("%Y-%m-%d %H:%M:%S")
+            sleep_end_time = records[-1].timestamp.strftime("%Y-%m-%d %H:%M:%S")
+            self.sleep_start_label.setText(f"入睡时间：{sleep_start_time}")
+            self.sleep_end_label.setText(f"清醒时间：{sleep_end_time}")
+        
         # 更新深睡比例
         self.deep_sleep_label.setText(f"深睡比例：{sleep_quality['deep_sleep_ratio']:.1f}%")
         
@@ -1606,8 +1753,44 @@ class SleepAnalysisWindow(QWidget):
         y_data = states
         self.sleep_curve.setData(x_data, y_data)
         
+        # 更新睡眠状态分布饼图
+        self.update_pie_chart(states)
+        
         # 更新改善建议
         self.update_advice(sleep_quality)
+
+    def update_pie_chart(self, states):
+        """更新睡眠状态分布"""
+        # 计算各状态的数量
+        awake_count = states.count(0)
+        light_sleep_count = states.count(1)
+        deep_sleep_count = states.count(2)
+        total_count = len(states)
+        
+        if total_count == 0:
+            # 重置进度条
+            self.awake_bar.setValue(0)
+            self.awake_bar.setFormat("清醒: 0%")
+            self.light_sleep_bar.setValue(0)
+            self.light_sleep_bar.setFormat("浅睡: 0%")
+            self.deep_sleep_bar.setValue(0)
+            self.deep_sleep_bar.setFormat("深睡: 0%")
+            return
+        
+        # 计算百分比
+        awake_percent = awake_count / total_count * 100
+        light_sleep_percent = light_sleep_count / total_count * 100
+        deep_sleep_percent = deep_sleep_count / total_count * 100
+        
+        # 更新进度条
+        self.awake_bar.setValue(int(awake_percent))
+        self.awake_bar.setFormat(f"清醒: {awake_percent:.1f}%")
+        
+        self.light_sleep_bar.setValue(int(light_sleep_percent))
+        self.light_sleep_bar.setFormat(f"浅睡: {light_sleep_percent:.1f}%")
+        
+        self.deep_sleep_bar.setValue(int(deep_sleep_percent))
+        self.deep_sleep_bar.setFormat(f"深睡: {deep_sleep_percent:.1f}%")
 
     def update_advice(self, sleep_quality):
         advice = []
