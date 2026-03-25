@@ -31,50 +31,78 @@ class BleakWorker(QThread):
     rr_interval_received = pyqtSignal(list)
     status_changed = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
+    connection_lost = pyqtSignal()
 
     def __init__(self):
         super().__init__()
         self.running = False
         self.client = None
+        self.reconnect_count = 0
+        self.max_reconnect_attempts = 10
+        self.last_heart_rate_time = 0
+        self.heart_rate_timeout = 10  # 10秒没有收到心率数据则认为断连
 
     def run(self):
         self.running = True
         asyncio.run(self._run_ble())
 
     async def _run_ble(self):
-        try:
-            self.status_changed.emit("正在扫描心率设备...")
-            
-            device = await BleakScanner.find_device_by_filter(
-                lambda d, ad: HEART_RATE_SERVICE_UUID.lower() in [s.lower() for s in ad.service_uuids]
-            )
-            
-            if not device:
-                self.error_occurred.emit("未找到心率设备，请确保设备已开启并靠近电脑")
-                return
-            
-            self.status_changed.emit(f"已找到设备: {device.name or device.address}")
-            
-            async with BleakClient(device) as client:
-                self.client = client
-                self.status_changed.emit(f"已连接: {device.name or device.address}")
+        # 先扫描找到设备
+        self.status_changed.emit("正在扫描心率设备...")
+        device = await BleakScanner.find_device_by_filter(
+            lambda d, ad: HEART_RATE_SERVICE_UUID.lower() in [s.lower() for s in ad.service_uuids]
+        )
+        
+        if not device:
+            self.error_occurred.emit("未找到心率设备，请确保设备已开启并靠近电脑")
+            return
+        
+        device_address = device.address
+        device_name = device.name or device_address
+        self.status_changed.emit(f"已找到设备: {device_name}")
+        
+        # 循环尝试连接同一个设备
+        while self.running:
+            try:
+                async with BleakClient(device_address) as client:
+                    self.client = client
+                    self.status_changed.emit(f"已连接: {device_name}")
+                    self.reconnect_count = 0  # 重置重连计数器
+                    self.last_heart_rate_time = time.time()  # 重置心跳时间
+                    
+                    await client.start_notify(
+                        HEART_RATE_MEASUREMENT_UUID,
+                        self._heart_rate_handler
+                    )
+                    
+                    while self.running:
+                        # 检查心率数据是否超时
+                        if time.time() - self.last_heart_rate_time > self.heart_rate_timeout:
+                            raise Exception("心率数据超时，设备可能已断连")
+                        await asyncio.sleep(1)  # 每1秒检查一次
+                    
+                    await client.stop_notify(HEART_RATE_MEASUREMENT_UUID)
+                    break  # 正常停止，退出循环
                 
-                await client.start_notify(
-                    HEART_RATE_MEASUREMENT_UUID,
-                    self._heart_rate_handler
-                )
+            except Exception as e:
+                if not self.running:
+                    break  # 正常停止，退出循环
                 
-                while self.running:
-                    await asyncio.sleep(0.1)
+                self.reconnect_count += 1
+                if self.reconnect_count > self.max_reconnect_attempts:
+                    self.error_occurred.emit(f"连接失败: 已尝试重连{self.max_reconnect_attempts}次，请检查设备状态")
+                    self.connection_lost.emit()
+                    break
                 
-                await client.stop_notify(HEART_RATE_MEASUREMENT_UUID)
+                self.status_changed.emit(f"连接断开，正在尝试重连... ({self.reconnect_count}/{self.max_reconnect_attempts})")
+                await asyncio.sleep(2)  # 等待2秒后重试
                 
-        except Exception as e:
-            self.error_occurred.emit(f"蓝牙错误: {str(e)}")
-        finally:
-            self.status_changed.emit("已断开连接")
-
+        self.status_changed.emit("已断开连接")
+        
     def _heart_rate_handler(self, sender, data):
+        # 更新最后收到心率数据的时间
+        self.last_heart_rate_time = time.time()
+        
         if len(data) < 2:
             return
         
@@ -487,6 +515,13 @@ class HomePage(QWidget):
         self.status_label.setStyleSheet("color: #95A5A6;")
         layout.addWidget(self.status_label)
         
+        # 重连状态显示标签
+        self.reconnect_status_label = QLabel("")
+        self.reconnect_status_label.setFont(QFont("Arial", 10))
+        self.reconnect_status_label.setAlignment(Qt.AlignRight)
+        self.reconnect_status_label.setStyleSheet("color: #E74C3C; font-weight: bold;")
+        layout.addWidget(self.reconnect_status_label)
+        
         layout.addSpacing(30)
         
         button_layout = QHBoxLayout()
@@ -570,6 +605,7 @@ class HomePage(QWidget):
         self.ble_worker.rr_interval_received.connect(self.update_rr_intervals)
         self.ble_worker.status_changed.connect(self.update_status)
         self.ble_worker.error_occurred.connect(self.show_error)
+        self.ble_worker.connection_lost.connect(self.stop_receiving)
         self.ble_worker.start()
 
     def stop_receiving(self):
@@ -808,6 +844,12 @@ class HomePage(QWidget):
 
     def update_status(self, status):
         self.status_label.setText(status)
+        
+        # 更新重连状态显示
+        if "重连" in status:
+            self.reconnect_status_label.setText(status)
+        else:
+            self.reconnect_status_label.setText("")
 
     def show_error(self, message):
         QMessageBox.warning(self, "错误", message)
