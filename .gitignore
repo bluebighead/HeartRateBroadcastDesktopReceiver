@@ -28,3 +28,5 @@ ENV/
 .DS_Store
 Thumbs.db
 HeartRateData/
+main.exe
+settings.json
