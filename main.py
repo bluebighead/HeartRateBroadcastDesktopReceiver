@@ -20,7 +20,7 @@ from PyQt5.QtGui import QFont
 from bleak import BleakClient, BleakScanner
 import pyqtgraph as pg
 
-APP_VERSION = "v1.0.1"
+APP_VERSION = "v1.0.2"
 GITHUB_REPO = "bluebighead/HeartRateBroadcastDesktopReceiver"
 GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -2546,11 +2546,176 @@ class HeartRateWindow(QMainWindow):
     def download_and_install_update(self, release_data):
         """自动下载并安装新版本"""
         try:
+            # 导入必要的模块
+            import webbrowser
             # 显示下载进度对话框
-            from PyQt5.QtWidgets import QProgressDialog
-            progress = QProgressDialog("正在下载更新...", "取消", 0, 100, self)
-            progress.setWindowTitle("下载更新")
-            progress.setWindowModality(True)
+            from PyQt5.QtWidgets import QProgressDialog, QPushButton, QVBoxLayout, QWidget, QLabel
+            
+            # 创建自定义窗口作为下载进度对话框
+            from PyQt5.QtWidgets import QDialog
+            
+            # 创建自定义对话框
+            class DownloadDialog(QDialog):
+                def __init__(self, parent=None, release_url="", thread_count=16):
+                    super().__init__(parent)
+                    self.setWindowTitle("下载更新")
+                    self.setWindowModality(True)
+                    self.resize(350, 220)
+                    
+                    # 创建布局
+                    layout = QVBoxLayout(self)
+                    
+                    # 添加标题
+                    self.title_label = QLabel("正在下载更新...")
+                    self.title_label.setAlignment(Qt.AlignCenter)
+                    layout.addWidget(self.title_label)
+                    
+                    # 添加进度条
+                    from PyQt5.QtWidgets import QProgressBar
+                    self.progress_bar = QProgressBar()
+                    self.progress_bar.setRange(0, 100)
+                    self.progress_bar.setValue(0)
+                    layout.addWidget(self.progress_bar)
+                    
+                    # 添加下载速度显示
+                    self.speed_label = QLabel("下载速度: 0.0 MB/s")
+                    self.speed_label.setAlignment(Qt.AlignCenter)
+                    layout.addWidget(self.speed_label)
+                    
+                    # 添加线程数显示
+                    self.thread_label = QLabel(f"下载线程: {thread_count} 线程")
+                    self.thread_label.setAlignment(Qt.AlignCenter)
+                    layout.addWidget(self.thread_label)
+                    
+                    # 添加内存使用显示
+                    self.memory_label = QLabel("内存使用: 0 MB / 0 MB")
+                    self.memory_label.setAlignment(Qt.AlignCenter)
+                    layout.addWidget(self.memory_label)
+                    
+                    # 添加更新网址按钮
+                    if release_url:
+                        self.url_button = QPushButton("访问更新网址")
+                        self.url_button.clicked.connect(lambda: webbrowser.open(release_url))
+                        layout.addWidget(self.url_button)
+                    
+                    # 添加按钮布局
+                    button_layout = QVBoxLayout()
+                    
+                    # 添加取消按钮
+                    self.cancel_button = QPushButton("取消")
+                    self.cancel_button.clicked.connect(self.reject)
+                    button_layout.addWidget(self.cancel_button)
+                    
+                    layout.addLayout(button_layout)
+                    
+                    # 启动内存监控定时器
+                    self.memory_timer = None
+                    try:
+                        from PyQt5.QtCore import QTimer
+                        self.memory_timer = QTimer(self)
+                        self.memory_timer.timeout.connect(self.update_memory_usage)
+                        self.memory_timer.start(1000)  # 每秒更新一次
+                        self.update_memory_usage()  # 立即更新一次
+                    except ImportError:
+                        pass
+                
+                def set_progress(self, value, speed=0):
+                    self.progress_bar.setValue(value)
+                    self.speed_label.setText(f"下载速度: {speed:.1f} MB/s")
+                
+                def update_memory_usage(self):
+                    """更新内存使用情况"""
+                    try:
+                        # 尝试使用Windows API获取内存信息
+                        import ctypes
+                        class MEMORYSTATUSEX(ctypes.Structure):
+                            _fields_ = [
+                                ("dwLength", ctypes.c_ulong),
+                                ("dwMemoryLoad", ctypes.c_ulong),
+                                ("ullTotalPhys", ctypes.c_ulonglong),
+                                ("ullAvailPhys", ctypes.c_ulonglong),
+                                ("ullTotalPageFile", ctypes.c_ulonglong),
+                                ("ullAvailPageFile", ctypes.c_ulonglong),
+                                ("ullTotalVirtual", ctypes.c_ulonglong),
+                                ("ullAvailVirtual", ctypes.c_ulonglong),
+                                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                            ]
+                        
+                        memory_status = MEMORYSTATUSEX()
+                        memory_status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+                        
+                        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(memory_status)):
+                            total = memory_status.ullTotalPhys / (1024 * 1024)  # 转换为MB
+                            used = (memory_status.ullTotalPhys - memory_status.ullAvailPhys) / (1024 * 1024)  # 转换为MB
+                            percent = memory_status.dwMemoryLoad
+                            self.memory_label.setText(f"内存使用: {used:.0f} MB / {total:.0f} MB ({percent}%)")
+                        else:
+                            # Windows API调用失败，尝试使用psutil
+                            try:
+                                import psutil
+                                memory = psutil.virtual_memory()
+                                used = memory.used / (1024 * 1024)  # 转换为MB
+                                total = memory.total / (1024 * 1024)  # 转换为MB
+                                percent = memory.percent
+                                self.memory_label.setText(f"内存使用: {used:.0f} MB / {total:.0f} MB ({percent:.1f}%)")
+                            except:
+                                self.memory_label.setText("内存使用: 不可用")
+                    except Exception as e:
+                        # 所有方法都失败，显示不可用
+                        self.memory_label.setText("内存使用: 不可用")
+                
+                def reject(self):
+                    """处理取消按钮点击"""
+                    # 停止内存监控定时器
+                    if self.memory_timer:
+                        self.memory_timer.stop()
+                    super().reject()
+                
+                def closeEvent(self, event):
+                    """处理窗口关闭事件"""
+                    # 停止内存监控定时器
+                    if self.memory_timer:
+                        self.memory_timer.stop()
+                    super().closeEvent(event)
+            
+            # 自动检测最佳线程数
+            try:
+                import psutil
+                
+                # 获取CPU逻辑处理器数（不是物理核心数）
+                cpu_count = psutil.cpu_count(logical=True) or 4
+                
+                # 获取总内存（GB）
+                total_memory = psutil.virtual_memory().total / (1024 * 1024 * 1024)
+                
+                # 获取可用内存（GB）
+                available_memory = psutil.virtual_memory().available / (1024 * 1024 * 1024)
+                
+                # 根据CPU逻辑处理器数和内存计算最佳线程数
+                # 基础线程数 = 逻辑处理器数
+                base_threads = cpu_count
+                
+                # 根据内存调整
+                if total_memory < 4:
+                    # 内存不足，使用基础线程数
+                    thread_count = base_threads
+                elif total_memory < 8:
+                    # 内存一般，使用基础线程数 * 2
+                    thread_count = base_threads * 2
+                else:
+                    # 内存充足，使用基础线程数 * 3，最多64线程
+                    thread_count = min(64, base_threads * 3)
+                
+                # 确保线程数在合理范围内
+                thread_count = max(4, min(64, thread_count))
+            except ImportError:
+                # 如果psutil模块不存在，使用默认线程数
+                thread_count = 16
+            
+            # 创建下载对话框
+            release_url = release_data.get('html_url', '')
+            # 传递线程数给对话框
+            progress = DownloadDialog(self, release_url, thread_count)
             progress.show()
             
             # 获取下载链接
@@ -2573,44 +2738,206 @@ class HeartRateWindow(QMainWindow):
             
             # 创建下载线程
             class DownloadThread(QThread):
-                progress_updated = pyqtSignal(int)
+                progress_updated = pyqtSignal(int, float)  # (进度百分比, 下载速度KB/s)
                 download_finished = pyqtSignal(str)
                 download_error = pyqtSignal(str)
                 
-                def __init__(self, url, save_path):
+                def __init__(self, url, save_path, thread_count=16):
                     super().__init__()
+                    import threading
                     self.url = url
                     self.save_path = save_path
+                    self.thread_count = thread_count
                     self.is_canceled = False
+                    self.total_size = 0
+                    self.downloaded_size = 0
+                    self.start_time = 0
+                    self.last_time = 0
+                    self.last_size = 0
+                    self.speed_history = []  # 速度历史记录，用于平滑
+                    self.max_history = 5  # 保存最近5次速度记录
+                    self.download_lock = threading.Lock()  # 线程锁，确保downloaded_size的线程安全
+                    self.last_progress_update = 0  # 上次更新进度的时间
+                    self.update_interval = 0.5  # 进度更新间隔（秒）
                 
                 def run(self):
                     try:
                         import urllib.request
+                        import os
+                        import time
                         
-                        def report_progress(count, block_size, total_size):
-                            if self.is_canceled:
-                                raise Exception("下载被用户取消")
-                            percent = min(int(count * block_size * 100 / total_size), 100)
-                            self.progress_updated.emit(percent)
+                        # 获取文件大小
+                        with urllib.request.urlopen(self.url) as response:
+                            self.total_size = int(response.headers.get('Content-Length', 0))
                         
-                        urllib.request.urlretrieve(self.url, self.save_path, reporthook=report_progress)
+                        self.start_time = time.time()
+                        self.last_time = self.start_time
+                        self.last_size = 0
+                        self.last_progress_update = self.start_time
+                        
+                        if self.total_size == 0:
+                            # 如果无法获取文件大小，使用原始方法
+                            def report_progress(count, block_size, total_size):
+                                if self.is_canceled:
+                                    raise Exception("下载被用户取消")
+                                percent = min(int(count * block_size * 100 / total_size), 100)
+                                current_time = time.time()
+                                
+                                # 控制进度更新频率
+                                if current_time - self.last_progress_update >= self.update_interval:
+                                    current_size = count * block_size
+                                    speed = self.calculate_speed(current_size)
+                                    self.last_progress_update = current_time
+                                    self.progress_updated.emit(percent, speed)
+                            
+                            urllib.request.urlretrieve(self.url, self.save_path, reporthook=report_progress)
+                        else:
+                            # 使用多线程下载
+                            self.multi_thread_download(self.thread_count)
+                        
                         self.download_finished.emit(self.save_path)
                     except Exception as e:
                         self.download_error.emit(str(e))
+                
+                def calculate_speed(self, current_size=None):
+                    """计算下载速度并平滑"""
+                    import time
+                    current_time = time.time()
+                    elapsed = current_time - self.last_time
+                    
+                    # 确保时间间隔至少为0.5秒，避免因时间太短导致速度计算过高
+                    if elapsed < 0.5:
+                        return self.speed_history[-1] if self.speed_history else 0
+                    
+                    if elapsed > 0:
+                        if current_size is None:
+                            current_size = self.downloaded_size
+                        current_speed = (current_size - self.last_size) / (1024 * 1024 * elapsed)  # MB/s
+                        
+                        # 限制最大显示速度，避免异常值
+                        max_speed = 100  # 最大显示速度为100 MB/s
+                        current_speed = min(current_speed, max_speed)
+                        
+                        # 添加到速度历史记录
+                        self.speed_history.append(current_speed)
+                        
+                        # 保持历史记录长度
+                        if len(self.speed_history) > self.max_history:
+                            self.speed_history.pop(0)
+                        
+                        # 使用加权平均，给最近的速度值更高的权重
+                        if self.speed_history:
+                            weights = [0.1, 0.2, 0.3, 0.4, 0.5]  # 权重递增，最近的值权重更高
+                            if len(self.speed_history) < len(weights):
+                                weights = weights[:len(self.speed_history)]
+                            # 归一化权重
+                            weight_sum = sum(weights)
+                            normalized_weights = [w / weight_sum for w in weights]
+                            # 计算加权平均
+                            smoothed_speed = sum(speed * weight for speed, weight in zip(self.speed_history, normalized_weights))
+                        else:
+                            smoothed_speed = 0
+                        
+                        self.last_time = current_time
+                        self.last_size = current_size
+                        return smoothed_speed
+                    return 0
+                
+                def multi_thread_download(self, thread_count):
+                    """多线程下载"""
+                    import urllib.request
+                    import os
+                    import threading
+                    import time
+                    
+                    # 每个线程下载的大小
+                    chunk_size = self.total_size // thread_count
+                    
+                    # 创建临时文件
+                    temp_files = []
+                    threads = []
+                    
+                    def download_chunk(start, end, temp_file):
+                        if self.is_canceled:
+                            return
+                        
+                        headers = {'Range': f'bytes={start}-{end}'}
+                        req = urllib.request.Request(self.url, headers=headers)
+                        
+                        with urllib.request.urlopen(req) as response:
+                            with open(temp_file, 'wb') as f:
+                                local_downloaded = 0  # 本地下载计数
+                                while True:
+                                    if self.is_canceled:
+                                        return
+                                    chunk = response.read(8192)
+                                    if not chunk:
+                                        break
+                                    f.write(chunk)
+                                    chunk_len = len(chunk)
+                                    local_downloaded += chunk_len
+                                    
+                                    # 使用锁更新全局下载大小
+                                    with self.download_lock:
+                                        self.downloaded_size += chunk_len
+                                    
+                                    # 控制进度更新频率
+                                    current_time = time.time()
+                                    if current_time - self.last_progress_update >= self.update_interval:
+                                        percent = min(int(self.downloaded_size * 100 / self.total_size), 100)
+                                        speed = self.calculate_speed()
+                                        self.last_progress_update = current_time
+                                        self.progress_updated.emit(percent, speed)
+                    
+                    # 创建线程
+                    for i in range(thread_count):
+                        start = i * chunk_size
+                        end = start + chunk_size - 1 if i < thread_count - 1 else self.total_size - 1
+                        temp_file = f"{self.save_path}.part{i}"
+                        temp_files.append(temp_file)
+                        
+                        thread = threading.Thread(target=download_chunk, args=(start, end, temp_file))
+                        threads.append(thread)
+                        thread.start()
+                    
+                    # 等待所有线程完成
+                    for thread in threads:
+                        thread.join()
+                    
+                    if self.is_canceled:
+                        # 清理临时文件
+                        for temp_file in temp_files:
+                            if os.path.exists(temp_file):
+                                os.remove(temp_file)
+                        raise Exception("下载被用户取消")
+                    
+                    # 合并临时文件
+                    with open(self.save_path, 'wb') as f:
+                        for temp_file in temp_files:
+                            if os.path.exists(temp_file):
+                                with open(temp_file, 'rb') as tf:
+                                    f.write(tf.read())
+                                os.remove(temp_file)
                 
                 def cancel(self):
                     self.is_canceled = True
             
             # 创建并启动下载线程
-            download_thread = DownloadThread(download_url, file_name)
+            download_thread = DownloadThread(download_url, file_name, thread_count)
             
-            def update_progress(percent):
-                progress.setValue(percent)
+            def update_progress(percent, speed):
+                progress.set_progress(percent, speed)
             
             def on_download_finished(path):
                 progress.close()
                 # 运行安装程序
-                QMessageBox.information(self, "下载完成", "更新文件已下载完成，即将开始安装")
+                msg_box = QMessageBox()
+                msg_box.setIcon(QMessageBox.Information)
+                msg_box.setWindowTitle("下载完成")
+                msg_box.setText("更新文件已下载完成，即将开始安装")
+                msg_box.setStandardButtons(QMessageBox.Ok)
+                msg_box.exec_()  # 阻塞等待用户点击
+                
                 import subprocess
                 subprocess.Popen([path])
                 # 退出当前应用程序
@@ -2637,7 +2964,8 @@ class HeartRateWindow(QMainWindow):
             def on_cancel():
                 download_thread.cancel()
             
-            progress.canceled.connect(on_cancel)
+            # 连接取消按钮信号
+            progress.cancel_button.clicked.connect(on_cancel)
             
         except Exception as e:
             QMessageBox.warning(self, "更新失败", f"自动更新失败: {str(e)}")
@@ -2678,9 +3006,9 @@ class HeartRateWindow(QMainWindow):
                 if reply == QMessageBox.Ok:
                     # 尝试自动下载并安装新版本
                     self.download_and_install_update(data)
-                
-                # 无论用户选择什么，都退出软件
-                QApplication.instance().quit()
+                else:
+                    # 用户取消更新，退出软件
+                    QApplication.instance().quit()
                 
         except urllib.error.HTTPError as e:
             if e.code != 404:
