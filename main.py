@@ -1,17 +1,18 @@
 import sys
+import os
 import asyncio
 import time
 import json
 import csv
 import urllib.request
 import urllib.error
-from datetime import datetime
+from datetime import datetime, date
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QMessageBox, QStackedWidget, QTableWidget,
     QTableWidgetItem, QHeaderView, QAbstractItemView, QGraphicsOpacityEffect,
     QDialog, QCheckBox, QLineEdit, QComboBox, QSpinBox, QFormLayout,
-    QMenuBar, QAction, QGroupBox, QFileDialog
+    QMenuBar, QAction, QGroupBox, QFileDialog, QTabWidget, QTextEdit
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QPropertyAnimation, QEasingCurve, pyqtProperty
 from PyQt5.QtGui import QFont
@@ -355,10 +356,30 @@ class HomePage(QWidget):
         
         self.calorie_timer = QTimer()
         self.calorie_timer.timeout.connect(self.update_calories)
+        
+    def update_time(self):
+        """更新实时时间显示"""
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.time_label.setText(current_time)
 
     def init_ui(self):
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignCenter)
+        
+        # 添加实时时间显示
+        self.time_label = QLabel()
+        self.time_label.setFont(QFont("Arial", 16))
+        self.time_label.setAlignment(Qt.AlignCenter)
+        self.time_label.setStyleSheet("color: #2C3E50;")
+        layout.addWidget(self.time_label)
+        
+        # 更新时间的定时器
+        self.time_timer = QTimer()
+        self.time_timer.timeout.connect(self.update_time)
+        self.time_timer.start(1000)  # 每秒更新一次
+        self.update_time()  # 初始更新
+        
+        layout.addSpacing(10)
         
         heart_layout = QHBoxLayout()
         heart_layout.setAlignment(Qt.AlignCenter)
@@ -973,18 +994,55 @@ class ChartWindow(QWidget):
     def __init__(self, record_page, parent=None):
         super().__init__(parent)
         self.record_page = record_page
-        self.setWindowTitle("心率折线图")
-        self.setMinimumSize(800, 500)
+        self.setWindowTitle("心率数据可视化")
+        self.setMinimumSize(800, 600)
         self.init_ui()
         
         self.update_timer = QTimer()
-        self.update_timer.timeout.connect(self.update_chart)
+        self.update_timer.timeout.connect(self.update_charts)
         self.update_timer.start(500)
 
     def init_ui(self):
         layout = QVBoxLayout(self)
         
         pg.setConfigOptions(antialias=True)
+        
+        # 添加选项卡
+        self.tab_widget = QTabWidget()
+        layout.addWidget(self.tab_widget)
+        
+        # 折线图标签页
+        self.line_chart_tab = QWidget()
+        self.tab_widget.addTab(self.line_chart_tab, "折线图")
+        self.init_line_chart()
+        
+        # 热图标签页
+        self.heatmap_tab = QWidget()
+        self.tab_widget.addTab(self.heatmap_tab, "心率热图")
+        self.init_heatmap()
+        
+        # 趋势图标签页
+        self.trend_tab = QWidget()
+        self.tab_widget.addTab(self.trend_tab, "周/月趋势")
+        self.init_trend_chart()
+        
+        info_layout = QHBoxLayout()
+        
+        self.current_label = QLabel("当前心率: -- BPM")
+        self.current_label.setFont(QFont("Arial", 12))
+        self.current_label.setStyleSheet("color: #2C3E50;")
+        info_layout.addWidget(self.current_label)
+        
+        self.count_label = QLabel("数据点: 0")
+        self.count_label.setFont(QFont("Arial", 12))
+        self.count_label.setStyleSheet("color: #2C3E50;")
+        info_layout.addWidget(self.count_label)
+        
+        info_layout.addStretch()
+        layout.addLayout(info_layout)
+
+    def init_line_chart(self):
+        layout = QVBoxLayout(self.line_chart_tab)
         
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.setBackground('w')
@@ -1002,42 +1060,665 @@ class ChartWindow(QWidget):
         )
         
         layout.addWidget(self.plot_widget)
-        
-        info_layout = QHBoxLayout()
-        
-        self.current_label = QLabel("当前心率: -- BPM")
-        self.current_label.setFont(QFont("Arial", 12))
-        self.current_label.setStyleSheet("color: #2C3E50;")
-        info_layout.addWidget(self.current_label)
-        
-        self.count_label = QLabel("数据点: 0")
-        self.count_label.setFont(QFont("Arial", 12))
-        self.count_label.setStyleSheet("color: #2C3E50;")
-        info_layout.addWidget(self.count_label)
-        
-        info_layout.addStretch()
-        layout.addLayout(info_layout)
 
-    def update_chart(self):
+    def init_heatmap(self):
+        layout = QVBoxLayout(self.heatmap_tab)
+        
+        self.heatmap_widget = pg.PlotWidget()
+        self.heatmap_widget.setBackground('w')
+        self.heatmap_widget.setTitle("心率热图", color='#2C3E50', size='14pt')
+        self.heatmap_widget.setLabel('left', '小时', units='', color='#2C3E50')
+        self.heatmap_widget.setLabel('bottom', '日期', units='', color='#2C3E50')
+        
+        layout.addWidget(self.heatmap_widget)
+        
+        # 添加颜色说明
+        color_layout = QHBoxLayout()
+        color_layout.setAlignment(Qt.AlignCenter)
+        
+        # 低心率（蓝色）
+        low_label = QLabel("低心率")
+        low_label.setFont(QFont("Arial", 10))
+        low_label.setStyleSheet("color: #2C3E50;")
+        color_layout.addWidget(low_label)
+        
+        low_color = QLabel()
+        low_color.setFixedSize(20, 20)
+        low_color.setStyleSheet("background-color: #0000FF;")
+        color_layout.addWidget(low_color)
+        
+        # 中心率（紫色）
+        mid_label = QLabel("中心率")
+        mid_label.setFont(QFont("Arial", 10))
+        mid_label.setStyleSheet("color: #2C3E50;")
+        color_layout.addWidget(mid_label)
+        
+        mid_color = QLabel()
+        mid_color.setFixedSize(20, 20)
+        mid_color.setStyleSheet("background-color: #800080;")
+        color_layout.addWidget(mid_color)
+        
+        # 高心率（红色）
+        high_label = QLabel("高心率")
+        high_label.setFont(QFont("Arial", 10))
+        high_label.setStyleSheet("color: #2C3E50;")
+        color_layout.addWidget(high_label)
+        
+        high_color = QLabel()
+        high_color.setFixedSize(20, 20)
+        high_color.setStyleSheet("background-color: #FF0000;")
+        color_layout.addWidget(high_color)
+        
+        layout.addLayout(color_layout)
+
+    def init_trend_chart(self):
+        layout = QVBoxLayout(self.trend_tab)
+        
+        # 添加周/月选择按钮
+        button_layout = QHBoxLayout()
+        
+        self.week_button = QPushButton("周趋势")
+        self.week_button.setFont(QFont("Arial", 10))
+        self.week_button.setCheckable(True)
+        self.week_button.setChecked(True)
+        self.week_button.clicked.connect(lambda: self.set_trend_mode('week'))
+        button_layout.addWidget(self.week_button)
+        
+        self.month_button = QPushButton("月趋势")
+        self.month_button.setFont(QFont("Arial", 10))
+        self.month_button.setCheckable(True)
+        self.month_button.clicked.connect(lambda: self.set_trend_mode('month'))
+        button_layout.addWidget(self.month_button)
+        
+        button_layout.addStretch()
+        layout.addLayout(button_layout)
+        
+        self.trend_widget = pg.PlotWidget()
+        self.trend_widget.setBackground('w')
+        self.trend_widget.setTitle("周心率趋势", color='#2C3E50', size='14pt')
+        self.trend_widget.setLabel('left', '平均心率', 'BPM', color='#2C3E50')
+        self.trend_widget.setLabel('bottom', '日期', units='', color='#2C3E50')
+        self.trend_widget.showGrid(x=True, y=True, alpha=0.3)
+        self.trend_widget.setYRange(40, 200)
+        
+        self.trend_curve = self.trend_widget.plot(
+            pen=pg.mkPen(color='#3498DB', width=2),
+            symbol='o',
+            symbolSize=8,
+            symbolBrush='#3498DB'
+        )
+        
+        layout.addWidget(self.trend_widget)
+        
+        self.trend_mode = 'week'
+
+    def set_trend_mode(self, mode):
+        self.trend_mode = mode
+        self.week_button.setChecked(mode == 'week')
+        self.month_button.setChecked(mode == 'month')
+        
+        if mode == 'week':
+            self.trend_widget.setTitle("周心率趋势", color='#2C3E50', size='14pt')
+        else:
+            self.trend_widget.setTitle("月心率趋势", color='#2C3E50', size='14pt')
+        
+        self.update_charts()
+
+    def update_charts(self):
         records = self.record_page.records
         if not records:
+            # 更新折线图
             self.curve.setData([], [])
+            
+            # 清空热图
+            self.heatmap_widget.clear()
+            
+            # 更新趋势图
+            self.trend_curve.setData([], [])
+            
             self.current_label.setText("当前心率: -- BPM")
             self.count_label.setText("数据点: 0")
             return
         
+        # 更新基本信息
+        y_data = [r.heart_rate for r in records]
+        if y_data:
+            self.current_label.setText(f"当前心率: {y_data[-1]} BPM")
+        self.count_label.setText(f"数据点: {len(records)}")
+        
+        # 更新折线图
+        self.update_line_chart(records)
+        
+        # 更新热图
+        self.update_heatmap(records)
+        
+        # 更新趋势图
+        self.update_trend_chart(records)
+
+    def update_line_chart(self, records):
         x_data = list(range(1, len(records) + 1))
         y_data = [r.heart_rate for r in records]
         
         self.curve.setData(x_data, y_data)
+
+    def update_heatmap(self, records):
+        # 准备热图数据
+        from collections import defaultdict
+        import numpy as np
         
-        if y_data:
-            self.current_label.setText(f"当前心率: {y_data[-1]} BPM")
-        self.count_label.setText(f"数据点: {len(records)}")
+        # 按日期和小时分组
+        data = defaultdict(lambda: defaultdict(int))
+        dates = set()
+        hours = set()
+        
+        for record in records:
+            date = record.timestamp.date()
+            hour = record.timestamp.hour
+            data[date][hour] = record.heart_rate
+            dates.add(date)
+            hours.add(hour)
+        
+        if not dates:
+            return
+        
+        # 排序日期和小时
+        sorted_dates = sorted(dates)
+        sorted_hours = sorted(hours)
+        
+        # 清除现有热图
+        self.heatmap_widget.clear()
+        
+        # 使用散点图模拟热图效果
+        scatter_data = []
+        colors = []
+        
+        for i, date in enumerate(sorted_dates):
+            for j, hour in enumerate(sorted_hours):
+                if hour in data[date]:
+                    heart_rate = data[date][hour]
+                    # 计算颜色（基于心率值）
+                    # 心率范围映射到0-255
+                    color_val = int((heart_rate - 40) / (200 - 40) * 255)
+                    color_val = max(0, min(255, color_val))
+                    # 使用蓝色到红色的渐变
+                    color = pg.mkColor((color_val, 0, 255 - color_val))
+                    scatter_data.append({'pos': (i, j), 'size': 20, 'pen': pg.mkPen(None), 'brush': color})
+        
+        # 创建散点图
+        scatter = pg.ScatterPlotItem()
+        scatter.addPoints(**{k: [d[k] for d in scatter_data] for k in scatter_data[0]}) if scatter_data else None
+        
+        # 添加散点图到 plot widget
+        if scatter_data:
+            self.heatmap_widget.addItem(scatter)
+        
+        # 设置轴标签
+        self.heatmap_widget.setXRange(-0.5, len(sorted_dates) - 0.5)
+        self.heatmap_widget.setYRange(-0.5, len(sorted_hours) - 0.5)
+        
+        # 设置刻度标签
+        self.heatmap_widget.getAxis('bottom').setTicks([[(i, str(date)) for i, date in enumerate(sorted_dates)]])
+        self.heatmap_widget.getAxis('left').setTicks([[(i, str(hour)) for i, hour in enumerate(sorted_hours)]])
+
+    def update_trend_chart(self, records):
+        # 从存储的历史数据文件中读取数据
+        from collections import defaultdict
+        import os
+        import json
+        from datetime import datetime, date
+        
+        daily_data = defaultdict(list)
+        
+        # 首先处理当前内存中的记录
+        for record in records:
+            record_date = record.timestamp.date()
+            daily_data[record_date].append(record.heart_rate)
+        
+        # 然后读取存储的历史数据文件
+        if hasattr(self, 'data_dir') and os.path.exists(self.data_dir):
+            # 遍历数据目录中的所有JSON文件
+            for filename in os.listdir(self.data_dir):
+                if filename.startswith('heart_rate_') and filename.endswith('.json'):
+                    file_path = os.path.join(self.data_dir, filename)
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                        
+                        # 处理记录数据
+                        for record_data in data.get('records', []):
+                            if isinstance(record_data, list) and len(record_data) == 2:
+                                # 新格式：[时间戳, 心率值]
+                                timestamp = datetime.fromtimestamp(record_data[0])
+                                heart_rate = record_data[1]
+                                record_date = timestamp.date()
+                                daily_data[record_date].append(heart_rate)
+                            elif isinstance(record_data, dict):
+                                # 旧格式
+                                heart_rate = record_data.get('heart_rate')
+                                timestamp_str = record_data.get('timestamp')
+                                if heart_rate and timestamp_str:
+                                    timestamp = datetime.fromisoformat(timestamp_str)
+                                    record_date = timestamp.date()
+                                    daily_data[record_date].append(heart_rate)
+                    except Exception as e:
+                        print(f"读取历史数据文件失败 {filename}: {str(e)}")
+        
+        # 计算每天的平均心率
+        date_avg = []
+        for record_date, rates in daily_data.items():
+            if rates:
+                avg_rate = sum(rates) / len(rates)
+                date_avg.append((record_date, avg_rate))
+        
+        # 按日期排序
+        date_avg.sort(key=lambda x: x[0])
+        
+        # 根据趋势模式筛选数据
+        if self.trend_mode == 'week':
+            # 只显示最近7天
+            if len(date_avg) > 7:
+                date_avg = date_avg[-7:]
+        else:
+            # 只显示最近30天
+            if len(date_avg) > 30:
+                date_avg = date_avg[-30:]
+        
+        # 准备数据
+        x_data = list(range(len(date_avg)))
+        y_data = [avg for _, avg in date_avg]
+        
+        # 更新趋势图
+        self.trend_curve.setData(x_data, y_data)
+        
+        # 设置X轴标签
+        dates = [str(record_date) for record_date, _ in date_avg]
+        self.trend_widget.getAxis('bottom').setTicks([[(i, date) for i, date in enumerate(dates)]])
 
     def closeEvent(self, event):
         self.update_timer.stop()
         event.accept()
+
+
+class SleepAnalysisWindow(QWidget):
+    def __init__(self, record_page, parent=None):
+        super().__init__(parent)
+        self.record_page = record_page
+        self.setWindowTitle("睡眠质量分析")
+        self.setMinimumSize(800, 600)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # 标题
+        title_label = QLabel("睡眠质量分析")
+        title_label.setFont(QFont("Arial", 18, QFont.Bold))
+        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setStyleSheet("color: #2C3E50; margin: 10px;")
+        layout.addWidget(title_label)
+        
+        # 睡眠分析结果
+        analysis_group = QGroupBox("睡眠分析结果")
+        analysis_layout = QVBoxLayout(analysis_group)
+        
+        # 睡眠状态分布
+        self.sleep_distribution_label = QLabel("睡眠状态分布：")
+        self.sleep_distribution_label.setFont(QFont("Arial", 12))
+        analysis_layout.addWidget(self.sleep_distribution_label)
+        
+        # 睡眠质量评分
+        self.sleep_quality_label = QLabel("睡眠质量评分：")
+        self.sleep_quality_label.setFont(QFont("Arial", 12))
+        analysis_layout.addWidget(self.sleep_quality_label)
+        
+        # 睡眠时长
+        self.sleep_duration_label = QLabel("睡眠时长：")
+        self.sleep_duration_label.setFont(QFont("Arial", 12))
+        analysis_layout.addWidget(self.sleep_duration_label)
+        
+        # 深睡比例
+        self.deep_sleep_label = QLabel("深睡比例：")
+        self.deep_sleep_label.setFont(QFont("Arial", 12))
+        analysis_layout.addWidget(self.deep_sleep_label)
+        
+        layout.addWidget(analysis_group)
+        
+        # 睡眠状态图表
+        chart_group = QGroupBox("睡眠状态趋势")
+        chart_layout = QVBoxLayout(chart_group)
+        
+        self.chart_widget = pg.PlotWidget()
+        self.chart_widget.setBackground('w')
+        self.chart_widget.setTitle("睡眠状态变化", color='#2C3E50', size='14pt')
+        self.chart_widget.setLabel('left', '睡眠状态', units='', color='#2C3E50')
+        self.chart_widget.setLabel('bottom', '时间', units='', color='#2C3E50')
+        self.chart_widget.showGrid(x=True, y=True, alpha=0.3)
+        self.chart_widget.setYRange(-0.5, 2.5)
+        
+        # 设置Y轴刻度
+        self.chart_widget.getAxis('left').setTicks([[(0, '清醒'), (1, '浅睡'), (2, '深睡')]])
+        
+        self.sleep_curve = self.chart_widget.plot(
+            pen=pg.mkPen(color='#27AE60', width=2),
+            symbol='o',
+            symbolSize=8,
+            symbolBrush='#27AE60'
+        )
+        
+        chart_layout.addWidget(self.chart_widget)
+        layout.addWidget(chart_group)
+        
+        # 改善建议
+        advice_group = QGroupBox("改善建议")
+        advice_layout = QVBoxLayout(advice_group)
+        
+        self.advice_text = QTextEdit()
+        self.advice_text.setReadOnly(True)
+        self.advice_text.setStyleSheet("background-color: #F8F9FA; border: 1px solid #E9ECEF;")
+        advice_layout.addWidget(self.advice_text)
+        
+        layout.addWidget(advice_group)
+        
+        # 按钮布局
+        button_layout = QHBoxLayout()
+        
+        analyze_button = QPushButton("分析睡眠")
+        analyze_button.setFont(QFont("Arial", 12))
+        analyze_button.setMinimumSize(120, 35)
+        analyze_button.setStyleSheet("""
+            QPushButton {
+                background-color: #3498DB;
+                color: white;
+                border: none;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #2980B9;
+            }
+        """)
+        analyze_button.clicked.connect(self.analyze_sleep)
+        button_layout.addWidget(analyze_button)
+        
+        export_button = QPushButton("导出报告")
+        export_button.setFont(QFont("Arial", 12))
+        export_button.setMinimumSize(120, 35)
+        export_button.setStyleSheet("""
+            QPushButton {
+                background-color: #9B59B6;
+                color: white;
+                border: none;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #8E44AD;
+            }
+        """)
+        export_button.clicked.connect(self.export_report)
+        button_layout.addWidget(export_button)
+        
+        button_layout.addStretch()
+        layout.addLayout(button_layout)
+        
+        # 初始分析
+        self.analyze_sleep()
+
+    def analyze_sleep(self):
+        records = self.record_page.records
+        if not records:
+            QMessageBox.warning(self, "提示", "没有足够的心率数据进行睡眠分析")
+            return
+        
+        # 智能睡眠检测：基于心率模式自动识别睡眠时段
+        sleep_periods = self.detect_sleep_periods(records)
+        
+        if not sleep_periods:
+            QMessageBox.warning(self, "提示", "未检测到睡眠时段")
+            return
+        
+        # 合并所有睡眠时段的记录
+        sleep_records = []
+        for start_idx, end_idx in sleep_periods:
+            sleep_records.extend(records[start_idx:end_idx+1])
+        
+        # 识别睡眠状态
+        sleep_states = self.identify_sleep_states(sleep_records)
+        
+        # 计算睡眠质量指标
+        sleep_quality = self.calculate_sleep_quality(sleep_states, sleep_records)
+        
+        # 更新UI
+        self.update_ui(sleep_states, sleep_quality, sleep_records)
+
+    def detect_sleep_periods(self, records):
+        """
+        基于心率模式自动检测睡眠时段
+        算法：
+        1. 计算心率移动平均值
+        2. 识别持续的低心率时段（可能的睡眠时段）
+        3. 过滤掉过短的时段
+        """
+        if len(records) < 10:  # 数据量不足
+            return []
+        
+        # 计算移动平均心率（窗口大小为5）
+        window_size = 5
+        moving_averages = []
+        
+        for i in range(len(records)):
+            start = max(0, i - window_size + 1)
+            window = records[start:i+1]
+            avg_hr = sum(r.heart_rate for r in window) / len(window)
+            moving_averages.append(avg_hr)
+        
+        # 识别睡眠时段
+        sleep_periods = []
+        current_period = []
+        sleep_threshold = 65  # 睡眠心率阈值
+        min_sleep_duration = 10  # 最小睡眠时长（记录数）
+        
+        for i, avg_hr in enumerate(moving_averages):
+            if avg_hr < sleep_threshold:
+                current_period.append(i)
+            else:
+                if len(current_period) >= min_sleep_duration:
+                    # 记录睡眠时段的起始和结束索引
+                    sleep_periods.append((current_period[0], current_period[-1]))
+                current_period = []
+        
+        # 处理最后一个时段
+        if len(current_period) >= min_sleep_duration:
+            sleep_periods.append((current_period[0], current_period[-1]))
+        
+        return sleep_periods
+
+    def identify_sleep_states(self, records):
+        """
+        识别睡眠状态：
+        - 清醒：心率 > 70 BPM
+        - 浅睡：60-70 BPM
+        - 深睡：< 60 BPM
+        """
+        states = []
+        for record in records:
+            heart_rate = record.heart_rate
+            if heart_rate > 70:
+                states.append(0)  # 清醒
+            elif 60 <= heart_rate <= 70:
+                states.append(1)  # 浅睡
+            else:
+                states.append(2)  # 深睡
+        return states
+
+    def calculate_sleep_quality(self, states, records):
+        """
+        计算睡眠质量：
+        - 睡眠时长
+        - 深睡比例
+        - 睡眠质量评分
+        """
+        # 计算睡眠时长（分钟）
+        start_time = records[0].timestamp
+        end_time = records[-1].timestamp
+        duration_minutes = (end_time - start_time).total_seconds() / 60
+        
+        # 计算深睡比例
+        deep_sleep_count = states.count(2)
+        total_sleep_count = len(states)
+        deep_sleep_ratio = (deep_sleep_count / total_sleep_count) * 100 if total_sleep_count > 0 else 0
+        
+        # 计算睡眠质量评分（0-100）
+        # 基于睡眠时长和深睡比例
+        duration_score = min(100, (duration_minutes / 480) * 100)  # 8小时为满分
+        deep_sleep_score = min(100, deep_sleep_ratio * 2)  # 50%深睡为满分
+        quality_score = (duration_score * 0.6) + (deep_sleep_score * 0.4)
+        
+        return {
+            'duration_minutes': duration_minutes,
+            'deep_sleep_ratio': deep_sleep_ratio,
+            'quality_score': quality_score,
+            'states': states
+        }
+
+    def update_ui(self, states, sleep_quality, records):
+        # 更新睡眠状态分布
+        awake_count = states.count(0)
+        light_sleep_count = states.count(1)
+        deep_sleep_count = states.count(2)
+        total_count = len(states)
+        
+        distribution_text = f"清醒: {awake_count/total_count*100:.1f}%, 浅睡: {light_sleep_count/total_count*100:.1f}%, 深睡: {deep_sleep_count/total_count*100:.1f}%"
+        self.sleep_distribution_label.setText(f"睡眠状态分布：{distribution_text}")
+        
+        # 更新睡眠质量评分
+        quality_score = sleep_quality['quality_score']
+        quality_level = "优秀" if quality_score >= 80 else "良好" if quality_score >= 60 else "一般" if quality_score >= 40 else "较差"
+        self.sleep_quality_label.setText(f"睡眠质量评分：{quality_score:.1f} ({quality_level})")
+        
+        # 更新睡眠时长
+        duration_hours = sleep_quality['duration_minutes'] / 60
+        self.sleep_duration_label.setText(f"睡眠时长：{duration_hours:.1f} 小时")
+        
+        # 更新深睡比例
+        self.deep_sleep_label.setText(f"深睡比例：{sleep_quality['deep_sleep_ratio']:.1f}%")
+        
+        # 更新睡眠状态图表
+        x_data = list(range(len(records)))
+        y_data = states
+        self.sleep_curve.setData(x_data, y_data)
+        
+        # 更新改善建议
+        self.update_advice(sleep_quality)
+
+    def update_advice(self, sleep_quality):
+        advice = []
+        quality_score = sleep_quality['quality_score']
+        duration_hours = sleep_quality['duration_minutes'] / 60
+        deep_sleep_ratio = sleep_quality['deep_sleep_ratio']
+        
+        if duration_hours < 7:
+            advice.append("• 建议增加睡眠时间，理想睡眠时长为7-8小时")
+        elif duration_hours > 9:
+            advice.append("• 睡眠时间过长，建议控制在7-8小时")
+        
+        if deep_sleep_ratio < 20:
+            advice.append("• 深睡比例偏低，建议保持规律的作息时间")
+            advice.append("• 睡前避免使用电子设备，创造安静的睡眠环境")
+        
+        if quality_score < 60:
+            advice.append("• 睡眠质量较差，建议：")
+            advice.append("  - 睡前进行放松活动，如冥想或深呼吸")
+            advice.append("  - 保持卧室温度适宜（18-20°C）")
+            advice.append("  - 避免睡前饮用含咖啡因的饮料")
+        elif quality_score < 80:
+            advice.append("• 睡眠质量良好，可进一步改善：")
+            advice.append("  - 保持规律的起床和睡觉时间")
+            advice.append("  - 睡前避免剧烈运动")
+        else:
+            advice.append("• 睡眠质量优秀，继续保持良好的睡眠习惯！")
+        
+        self.advice_text.setText("\n".join(advice))
+
+    def export_report(self):
+        records = self.record_page.records
+        if not records:
+            QMessageBox.warning(self, "提示", "没有足够的心率数据生成报告")
+            return
+        
+        # 智能睡眠检测：基于心率模式自动识别睡眠时段
+        sleep_periods = self.detect_sleep_periods(records)
+        
+        if not sleep_periods:
+            QMessageBox.warning(self, "提示", "未检测到睡眠时段")
+            return
+        
+        # 合并所有睡眠时段的记录
+        sleep_records = []
+        for start_idx, end_idx in sleep_periods:
+            sleep_records.extend(records[start_idx:end_idx+1])
+        
+        # 识别睡眠状态
+        sleep_states = self.identify_sleep_states(sleep_records)
+        
+        # 计算睡眠质量指标
+        sleep_quality = self.calculate_sleep_quality(sleep_states, sleep_records)
+        
+        # 生成报告
+        report = self.generate_report(sleep_quality, sleep_records, sleep_states)
+        
+        # 保存报告
+        file_path, _ = QFileDialog.getSaveFileName(self, "保存睡眠报告", "sleep_report.txt", "文本文件 (*.txt)")
+        if file_path:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(report)
+            QMessageBox.information(self, "成功", f"睡眠报告已导出到: {file_path}")
+
+    def generate_report(self, sleep_quality, records, states):
+        start_time = records[0].timestamp
+        end_time = records[-1].timestamp
+        
+        report = f"睡眠质量分析报告\n"
+        report += f"=" * 50 + "\n"
+        report += f"分析时间范围: {start_time.strftime('%Y-%m-%d %H:%M:%S')} 至 {end_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        report += f"睡眠时长: {sleep_quality['duration_minutes']/60:.1f} 小时\n"
+        report += f"睡眠质量评分: {sleep_quality['quality_score']:.1f}\n"
+        report += f"深睡比例: {sleep_quality['deep_sleep_ratio']:.1f}%\n"
+        
+        # 睡眠状态分布
+        awake_count = states.count(0)
+        light_sleep_count = states.count(1)
+        deep_sleep_count = states.count(2)
+        total_count = len(states)
+        
+        report += "\n睡眠状态分布:\n"
+        report += f"  清醒: {awake_count/total_count*100:.1f}% ({awake_count} 次记录)\n"
+        report += f"  浅睡: {light_sleep_count/total_count*100:.1f}% ({light_sleep_count} 次记录)\n"
+        report += f"  深睡: {deep_sleep_count/total_count*100:.1f}% ({deep_sleep_count} 次记录)\n"
+        
+        # 改善建议
+        report += "\n改善建议:\n"
+        if sleep_quality['duration_minutes']/60 < 7:
+            report += "• 建议增加睡眠时间，理想睡眠时长为7-8小时\n"
+        elif sleep_quality['duration_minutes']/60 > 9:
+            report += "• 睡眠时间过长，建议控制在7-8小时\n"
+        
+        if sleep_quality['deep_sleep_ratio'] < 20:
+            report += "• 深睡比例偏低，建议保持规律的作息时间\n"
+            report += "• 睡前避免使用电子设备，创造安静的睡眠环境\n"
+        
+        if sleep_quality['quality_score'] < 60:
+            report += "• 睡眠质量较差，建议：\n"
+            report += "  - 睡前进行放松活动，如冥想或深呼吸\n"
+            report += "  - 保持卧室温度适宜（18-20°C）\n"
+            report += "  - 避免睡前饮用含咖啡因的饮料\n"
+        elif sleep_quality['quality_score'] < 80:
+            report += "• 睡眠质量良好，可进一步改善：\n"
+            report += "  - 保持规律的起床和睡觉时间\n"
+            report += "  - 睡前避免剧烈运动\n"
+        else:
+            report += "• 睡眠质量优秀，继续保持良好的睡眠习惯！\n"
+        
+        report += "\n" + "=" * 50
+        return report
 
 
 class RecordPage(QWidget):
@@ -1048,6 +1729,7 @@ class RecordPage(QWidget):
         self.records = []
         self.chart_window = None
         self.stats_window = None
+        self.sleep_window = None
         self.init_ui()
 
     def init_ui(self):
@@ -1126,6 +1808,23 @@ class RecordPage(QWidget):
         stats_button.clicked.connect(self.show_stats)
         button_layout.addWidget(stats_button)
         
+        sleep_button = QPushButton("睡眠分析")
+        sleep_button.setFont(QFont("Arial", 12))
+        sleep_button.setMinimumSize(100, 35)
+        sleep_button.setStyleSheet("""
+            QPushButton {
+                background-color: #27AE60;
+                color: white;
+                border: none;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #229954;
+            }
+        """)
+        sleep_button.clicked.connect(self.show_sleep_analysis)
+        button_layout.addWidget(sleep_button)
+        
         button_layout.addStretch()
         
         clear_button = QPushButton("清空记录")
@@ -1165,6 +1864,15 @@ class RecordPage(QWidget):
             self.stats_window.raise_()
             self.stats_window.activateWindow()
 
+    def show_sleep_analysis(self):
+        if self.sleep_window is None or not self.sleep_window.isVisible():
+            self.sleep_window = SleepAnalysisWindow(self)
+            self.sleep_window.setWindowTitle("睡眠质量分析")
+            self.sleep_window.show()
+        else:
+            self.sleep_window.raise_()
+            self.sleep_window.activateWindow()
+
     def add_record(self, heart_rate, timestamp):
         record = HeartRateRecord(heart_rate, timestamp)
         self.records.append(record)
@@ -1190,7 +1898,13 @@ class HeartRateWindow(QMainWindow):
         self.show_hrv = False  # 默认关闭HRV
         self.obs_enabled = False  # 默认关闭OBS对接
         self.obs_file_path = "obs_heart_rate.txt"  # OBS数据文件路径
+        self.current_date = date.today()  # 当前日期
+        # 将默认数据存储路径改为软件的安装路径
+        self.data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "HeartRateData")  # 数据存储目录
+        self.init_data_dir()  # 初始化数据目录
         self.init_ui()
+        self.load_daily_records()  # 加载当日数据
+        self.setup_daily_reset()  # 设置每日重置定时器
 
     def init_ui(self):
         self.setWindowTitle(f"心率广播接收器 {APP_VERSION}")
@@ -1314,6 +2028,11 @@ class HeartRateWindow(QMainWindow):
         self.obs_action = QAction("对接OBS", self)
         self.obs_action.triggered.connect(self.show_obs_settings)
         settings_menu.addAction(self.obs_action)
+        
+        # 添加更改数据存储位置选项
+        self.data_location_action = QAction("更改数据存储位置", self)
+        self.data_location_action.triggered.connect(self.show_data_location_settings)
+        settings_menu.addAction(self.data_location_action)
         
         settings_menu.addSeparator()
         
@@ -1741,6 +2460,225 @@ class HeartRateWindow(QMainWindow):
         except Exception as e:
             pass
 
+    def init_data_dir(self):
+        """初始化数据存储目录"""
+        if not os.path.exists(self.data_dir):
+            os.makedirs(self.data_dir)
+
+    def setup_daily_reset(self):
+        """设置每日重置定时器"""
+        # 计算到今天24:00的时间差
+        now = datetime.now()
+        tomorrow = now.replace(hour=23, minute=59, second=59, microsecond=999999)
+        time_to_reset = (tomorrow - now).total_seconds() * 1000
+        
+        # 设置定时器
+        self.reset_timer = QTimer(self)
+        self.reset_timer.setSingleShot(True)
+        self.reset_timer.timeout.connect(self.daily_reset)
+        self.reset_timer.start(int(time_to_reset))
+
+    def daily_reset(self):
+        """每日重置操作"""
+        # 保存当日记录
+        self.save_daily_records()
+        
+        # 清空记录面板
+        self.record_page.clear_records()
+        
+        # 更新当前日期
+        self.current_date = date.today()
+        
+        # 重新设置定时器
+        self.setup_daily_reset()
+
+    def save_daily_records(self):
+        """保存当日记录到本地文件"""
+        records = self.record_page.records
+        if not records:
+            return
+        
+        # 生成文件名，格式为"xx年xx月xx日"
+        date_str = self.current_date.strftime("%Y年%m月%d日")
+        file_path = os.path.join(self.data_dir, f"heart_rate_{date_str}.json")
+        
+        # 数据验证：确保所有记录都包含有效的心率值和时间戳
+        valid_records = []
+        for r in records:
+            if hasattr(r, 'heart_rate') and hasattr(r, 'timestamp'):
+                if isinstance(r.heart_rate, (int, float)) and r.heart_rate > 0:
+                    valid_records.append(r)
+        
+        if not valid_records:
+            print("没有有效的记录可保存")
+            return
+        
+        # 优化数据格式，减少存储空间
+        # 使用更紧凑的格式：[时间戳, 心率值]
+        compact_records = [[r.timestamp.timestamp(), r.heart_rate] for r in valid_records]
+        
+        # 准备数据
+        data = {
+            "date": self.current_date.strftime("%Y-%m-%d"),
+            "records": compact_records,
+            "record_count": len(compact_records),
+            "generated_at": datetime.now().isoformat()
+        }
+        
+        # 保存数据，使用紧凑格式（无缩进）
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, separators=(',', ':'))
+        except Exception as e:
+            print(f"保存数据失败: {str(e)}")
+
+    def load_daily_records(self):
+        """加载当日数据"""
+        # 生成文件名，格式为"xx年xx月xx日"
+        date_str = self.current_date.strftime("%Y年%m月%d日")
+        file_path = os.path.join(self.data_dir, f"heart_rate_{date_str}.json")
+        
+        # 检查文件是否存在
+        if not os.path.exists(file_path):
+            return
+        
+        # 加载数据
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            # 数据验证：确保数据结构完整
+            if not isinstance(data, dict):
+                print("数据格式无效：不是有效的JSON对象")
+                return
+            
+            if 'records' not in data:
+                print("数据格式无效：缺少records字段")
+                return
+            
+            if not isinstance(data['records'], list):
+                print("数据格式无效：records不是有效的列表")
+                return
+            
+            # 清空当前记录
+            self.record_page.clear_records()
+            
+            # 加载记录
+            valid_count = 0
+            for record_data in data.get('records', []):
+                # 处理新的紧凑格式：[时间戳, 心率值]
+                if isinstance(record_data, list) and len(record_data) == 2:
+                    try:
+                        timestamp = datetime.fromtimestamp(record_data[0])
+                        heart_rate = record_data[1]
+                        if isinstance(heart_rate, (int, float)) and heart_rate > 0:
+                            self.record_page.add_record(heart_rate, timestamp)
+                            valid_count += 1
+                    except Exception as e:
+                        print(f"解析记录失败: {str(e)}")
+                # 兼容旧格式
+                elif isinstance(record_data, dict):
+                    try:
+                        heart_rate = record_data.get('heart_rate')
+                        timestamp_str = record_data.get('timestamp')
+                        if isinstance(heart_rate, (int, float)) and heart_rate > 0 and timestamp_str:
+                            timestamp = datetime.fromisoformat(timestamp_str)
+                            self.record_page.add_record(heart_rate, timestamp)
+                            valid_count += 1
+                    except Exception as e:
+                        print(f"解析记录失败: {str(e)}")
+            
+            print(f"成功加载 {valid_count} 条有效记录")
+        except json.JSONDecodeError as e:
+            print(f"JSON解析失败: {str(e)}")
+        except Exception as e:
+            print(f"加载数据失败: {str(e)}")
+
+    def show_data_location_settings(self):
+        """显示数据存储位置设置对话框"""
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFileDialog, QLineEdit
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("数据存储位置设置")
+        dialog.setMinimumWidth(500)
+        
+        layout = QVBoxLayout(dialog)
+        
+        # 当前存储位置
+        current_label = QLabel(f"当前存储位置: {self.data_dir}")
+        current_label.setWordWrap(True)
+        current_label.setStyleSheet("color: #2C3E50;")
+        layout.addWidget(current_label)
+        
+        layout.addSpacing(10)
+        
+        # 新存储位置
+        path_layout = QHBoxLayout()
+        path_label = QLabel("新存储位置:")
+        self.new_data_dir_edit = QLineEdit(self.data_dir)
+        browse_button = QPushButton("浏览...")
+        browse_button.clicked.connect(self.browse_data_location)
+        
+        path_layout.addWidget(path_label)
+        path_layout.addWidget(self.new_data_dir_edit, 1)
+        path_layout.addWidget(browse_button)
+        
+        layout.addLayout(path_layout)
+        
+        # 提示信息
+        hint_label = QLabel("提示：系统会在选择的位置自动创建'HeartRateData'文件夹来存储数据")
+        hint_label.setWordWrap(True)
+        hint_label.setStyleSheet("color: #7F8C8D; font-style: italic;")
+        layout.addWidget(hint_label)
+        
+        layout.addSpacing(20)
+        
+        # 按钮布局
+        button_layout = QHBoxLayout()
+        cancel_button = QPushButton("取消")
+        cancel_button.clicked.connect(dialog.reject)
+        
+        ok_button = QPushButton("确定")
+        ok_button.clicked.connect(dialog.accept)
+        
+        button_layout.addStretch()
+        button_layout.addWidget(cancel_button)
+        button_layout.addWidget(ok_button)
+        
+        layout.addLayout(button_layout)
+        
+        if dialog.exec_() == QDialog.Accepted:
+            new_dir = self.new_data_dir_edit.text().strip()
+            if new_dir and new_dir != self.data_dir:
+                try:
+                    # 在选择的位置创建HeartRateData文件夹
+                    data_dir = os.path.join(new_dir, "HeartRateData")
+                    
+                    # 确保目录存在
+                    if not os.path.exists(data_dir):
+                        os.makedirs(data_dir)
+                    
+                    # 更新数据目录
+                    old_dir = self.data_dir
+                    self.data_dir = data_dir
+                    
+                    # 立即保存当前记录到新位置
+                    self.save_daily_records()
+                    
+                    QMessageBox.information(self, "成功", f"数据存储位置已更新，当前记录已保存到新位置: {data_dir}")
+                except Exception as e:
+                    # 恢复到原目录
+                    self.data_dir = old_dir
+                    QMessageBox.critical(self, "错误", f"设置数据存储位置失败: {str(e)}")
+
+    def browse_data_location(self):
+        """浏览数据存储位置"""
+        directory = QFileDialog.getExistingDirectory(
+            self, "选择数据存储目录", self.data_dir
+        )
+        if directory:
+            self.new_data_dir_edit.setText(directory)
+
     def export_to_csv(self):
         records = self.record_page.records
         if not records:
@@ -1836,6 +2774,8 @@ class HeartRateWindow(QMainWindow):
 
     def on_heart_rate_recorded(self, heart_rate, timestamp):
         self.record_page.add_record(heart_rate, timestamp)
+        # 实时保存数据
+        self.save_daily_records()
 
     def toggle_hrv(self):
         # 切换HRV状态
