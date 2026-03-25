@@ -20,7 +20,7 @@ from PyQt5.QtGui import QFont
 from bleak import BleakClient, BleakScanner
 import pyqtgraph as pg
 
-APP_VERSION = "v1.0.2"
+APP_VERSION = "v1.0.1"
 GITHUB_REPO = "bluebighead/HeartRateBroadcastDesktopReceiver"
 GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -2571,26 +2571,73 @@ class HeartRateWindow(QMainWindow):
             temp_dir = tempfile.gettempdir()
             file_name = os.path.join(temp_dir, f"HeartRateReceiver_{release_data.get('tag_name', 'latest')}.exe")
             
-            def report_progress(count, block_size, total_size):
-                percent = int(count * block_size * 100 / total_size)
+            # 创建下载线程
+            class DownloadThread(QThread):
+                progress_updated = pyqtSignal(int)
+                download_finished = pyqtSignal(str)
+                download_error = pyqtSignal(str)
+                
+                def __init__(self, url, save_path):
+                    super().__init__()
+                    self.url = url
+                    self.save_path = save_path
+                    self.is_canceled = False
+                
+                def run(self):
+                    try:
+                        import urllib.request
+                        
+                        def report_progress(count, block_size, total_size):
+                            if self.is_canceled:
+                                raise Exception("下载被用户取消")
+                            percent = min(int(count * block_size * 100 / total_size), 100)
+                            self.progress_updated.emit(percent)
+                        
+                        urllib.request.urlretrieve(self.url, self.save_path, reporthook=report_progress)
+                        self.download_finished.emit(self.save_path)
+                    except Exception as e:
+                        self.download_error.emit(str(e))
+                
+                def cancel(self):
+                    self.is_canceled = True
+            
+            # 创建并启动下载线程
+            download_thread = DownloadThread(download_url, file_name)
+            
+            def update_progress(percent):
                 progress.setValue(percent)
-                QApplication.processEvents()
-                if progress.wasCanceled():
-                    raise Exception("下载被用户取消")
             
-            import urllib.request
-            urllib.request.urlretrieve(download_url, file_name, reporthook=report_progress)
+            def on_download_finished(path):
+                progress.close()
+                # 运行安装程序
+                QMessageBox.information(self, "下载完成", "更新文件已下载完成，即将开始安装")
+                import subprocess
+                subprocess.Popen([path])
+                # 退出当前应用程序
+                QApplication.instance().quit()
             
-            progress.close()
+            def on_download_error(error):
+                progress.close()
+                QMessageBox.warning(self, "更新失败", f"自动更新失败: {error}")
+                # 如果自动更新失败，回退到打开浏览器
+                release_url = release_data.get('html_url', '')
+                if release_url:
+                    import webbrowser
+                    webbrowser.open(release_url)
             
-            # 运行安装程序
-            QMessageBox.information(self, "下载完成", "更新文件已下载完成，即将开始安装")
+            # 连接信号
+            download_thread.progress_updated.connect(update_progress)
+            download_thread.download_finished.connect(on_download_finished)
+            download_thread.download_error.connect(on_download_error)
             
-            import subprocess
-            subprocess.Popen([file_name])
+            # 启动线程
+            download_thread.start()
             
-            # 退出当前应用程序
-            QApplication.instance().quit()
+            # 处理取消按钮
+            def on_cancel():
+                download_thread.cancel()
+            
+            progress.canceled.connect(on_cancel)
             
         except Exception as e:
             QMessageBox.warning(self, "更新失败", f"自动更新失败: {str(e)}")
